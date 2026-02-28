@@ -227,19 +227,19 @@ with st.sidebar:
     st.markdown("Upload CSV exports from BLUE Explorance for each department and year.")
 
     with st.expander("AUBMC General", expanded=True):
-        f_aubmc_23 = st.file_uploader("AUBMC 2023", type="csv", key="a23")
-        f_aubmc_24 = st.file_uploader("AUBMC 2024", type="csv", key="a24")
-        f_aubmc_25 = st.file_uploader("AUBMC 2025", type="csv", key="a25")
+        f_aubmc_23 = st.file_uploader("AUBMC 2023", type="csv", key="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")
+        f_aubmc_24 = st.file_uploader("AUBMC 2024", type="csv", key="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")
+        f_aubmc_25 = st.file_uploader("AUBMC 2025", type="csv", key="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")
 
     with st.expander("Emergency Department", expanded=False):
-        f_ed_23 = st.file_uploader("ED 2023", type="csv", key="e23")
-        f_ed_24 = st.file_uploader("ED 2024", type="csv", key="e24")
-        f_ed_25 = st.file_uploader("ED 2025", type="csv", key="e25")
+        f_ed_23 = st.file_uploader("ED 2023", type="csv", key="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")
+        f_ed_24 = st.file_uploader("ED 2024", type="csv", key="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")
+        f_ed_25 = st.file_uploader("ED 2025", type="csv", key="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")
 
     with st.expander("Pathology & Lab", expanded=False):
-        f_patho_23 = st.file_uploader("Patho 2023", type="csv", key="p23")
-        f_patho_24 = st.file_uploader("Patho 2024", type="csv", key="p24")
-        f_patho_25 = st.file_uploader("Patho 2025", type="csv", key="p25")
+        f_patho_23 = st.file_uploader("Patho 2023", type="csv", key="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")
+        f_patho_24 = st.file_uploader("Patho 2024", type="csv", key="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")
+        f_patho_25 = st.file_uploader("Patho 2025", type="csv", key="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")
 
     st.markdown("---")
     st.markdown("### 🔧 Settings")
