@@ -10,11 +10,6 @@ import warnings
 import json
 warnings.filterwarnings("ignore")
 
-try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -117,6 +112,13 @@ def compute_score(df):
 def add_year(df):
     if "fillout_date" in df.columns:
         df["year"] = pd.to_datetime(df["fillout_date"], errors="coerce").dt.year
+    elif "year" not in df.columns:
+        # Fallback: try to detect year column by name variants
+        year_candidates = [c for c in df.columns if "year" in c.lower() or "date" in c.lower()]
+        if year_candidates:
+            df["year"] = pd.to_datetime(df[year_candidates[0]], errors="coerce").dt.year
+        else:
+            df["year"] = np.nan  # year unknown — will be excluded from 2025 filter
     return df
 
 def aggregate_physician(df):
@@ -130,16 +132,15 @@ def add_outlier_flags(phys_df):
     df = phys_df.copy()
     scores   = df["avg_behavior_score"]
     pop_mean = scores.mean()
-    pop_std  = scores.std(ddof=0)
-    df["z_score"]           = (scores - pop_mean) / pop_std
-    df["low_z_outlier"]     = df["z_score"] <= -2
-    Q1, Q3                  = scores.quantile(0.25), scores.quantile(0.75)
-    IQR                     = Q3 - Q1
-    df["low_iqr_outlier"]   = scores < (Q1 - 1.5 * IQR)
-    df["low_bottom10"]      = scores <= scores.quantile(0.10)
-    df["se"]                = pop_std / np.sqrt(df["n_forms"])
-    df["lower_funnel_95"]   = pop_mean - 1.96 * df["se"]
-    df["low_funnel_outlier"]= scores < df["lower_funnel_95"]
+    pop_std  = scores.std(ddof=0) if len(scores) > 1 else 0
+
+    df["z_score"]         = (scores - pop_mean) / pop_std if pop_std > 0 else 0.0
+    df["low_z_outlier"]   = df["z_score"] <= -2
+
+    Q1, Q3                = scores.quantile(0.25), scores.quantile(0.75)
+    IQR                   = Q3 - Q1
+    df["low_iqr_outlier"] = scores < (Q1 - 1.5 * IQR) if IQR > 0 else False
+    df["low_bottom10"]    = scores <= scores.quantile(0.10)
     return df, pop_mean, pop_std
 
 vader = SentimentIntensityAnalyzer()
@@ -149,10 +150,9 @@ def score_vader(text, threshold=-0.05):
         s = vader.polarity_scores(str(text))
         c = s["compound"]
         label = "POSITIVE" if c >= abs(threshold) else ("NEGATIVE" if c <= threshold else "NEUTRAL")
-        return {"compound": c, "sentiment": label,
-                "vader_pos": s["pos"], "vader_neg": s["neg"]}
+        return {"compound": c, "sentiment": label}
     except:
-        return {"compound": 0.0, "sentiment": "NEUTRAL", "vader_pos": 0.0, "vader_neg": 0.0}
+        return {"compound": 0.0, "sentiment": "NEUTRAL"}
 
 def run_sentiment(df, threshold=-0.05):
     df_s = df[
@@ -165,7 +165,7 @@ def run_sentiment(df, threshold=-0.05):
     df_s = pd.concat([df_s, pd.DataFrame(results.tolist(), index=df_s.index)], axis=1)
     return df_s
 
-def sentiment_summary(df_sent, min_comments=5):
+def sentiment_summary(df_sent, min_comments=3, threshold=-0.05):
     s = (
         df_sent.assign(is_neg=(df_sent["sentiment"]=="NEGATIVE"))
         .groupby("physician_id", as_index=False)
@@ -189,13 +189,19 @@ def merge_sentiment(phys_df, sent_s):
 
 def add_risk(phys_df):
     df = phys_df.copy()
-    df["risk_score"] = df["low_funnel_outlier"].astype(int) + df["negative_outlier"].astype(int)
-    df["final_flag"] = df["risk_score"] == 2
+    # 4 independent flags — each worth 1 point
+    f1 = df["low_iqr_outlier"].fillna(False).astype(bool).astype(int)  if "low_iqr_outlier"  in df.columns else pd.Series(0, index=df.index)
+    f2 = df["low_z_outlier"].fillna(False).astype(bool).astype(int)    if "low_z_outlier"    in df.columns else pd.Series(0, index=df.index)
+    f3 = df["low_bottom10"].fillna(False).astype(bool).astype(int)     if "low_bottom10"     in df.columns else pd.Series(0, index=df.index)
+    f4 = df["negative_outlier"].fillna(False).astype(bool).astype(int) if "negative_outlier" in df.columns else pd.Series(0, index=df.index)
+    df["risk_score"] = f1 + f2 + f3 + f4
+    # 3-4 = Priority, 1-2 = Monitor, 0 = Clear
+    df["final_flag"] = df["risk_score"] >= 3
     return df
 
 def risk_pill(score):
-    if score == 2:   return '<span class="pill-red">⚠ Priority</span>'
-    if score == 1:   return '<span class="pill-yellow">👁 Monitor</span>'
+    if score >= 3:   return '<span class="pill-red">⚠ Priority</span>'
+    if score >= 1:   return '<span class="pill-yellow">👁 Monitor</span>'
     return '<span class="pill-green">✓ Clear</span>'
 
 def process_dept(df_raw, dept_name, threshold=-0.05):
@@ -203,11 +209,15 @@ def process_dept(df_raw, dept_name, threshold=-0.05):
     df = map_ratings(df)
     df = compute_score(df)
     df = add_year(df)
-    phys = aggregate_physician(df)
+    # Aggregate and flag on 2025 only — consistent with notebook methodology
+    df_2025 = df[df["year"] == 2025] if ("year" in df.columns and not df[df["year"] == 2025].empty) else df
+    phys = aggregate_physician(df_2025)
     phys, mean, std = add_outlier_flags(phys)
     sent_raw = run_sentiment(df, threshold) if "comments" in df.columns else pd.DataFrame()
     if not sent_raw.empty:
-        sent_s = sentiment_summary(sent_raw)
+        # Use 2025 only for negative_outlier flag (consistent with complaints logic)
+        sent_2025 = sent_raw[sent_raw["year"] == 2025] if "year" in sent_raw.columns and not sent_raw[sent_raw["year"] == 2025].empty else sent_raw
+        sent_s = sentiment_summary(sent_2025)
         phys   = merge_sentiment(phys, sent_s)
     else:
         phys["total_comments"]   = 0
@@ -227,19 +237,19 @@ with st.sidebar:
     st.markdown("Upload CSV exports from BLUE Explorance for each department and year.")
 
     with st.expander("AUBMC General", expanded=True):
-        f_aubmc_23 = st.file_uploader("AUBMC 2023", type="csv", key="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")
-        f_aubmc_24 = st.file_uploader("AUBMC 2024", type="csv", key="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")
-        f_aubmc_25 = st.file_uploader("AUBMC 2025", type="csv", key="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")
+        f_aubmc_23 = st.file_uploader("AUBMC 2023", type="csv", key="a23")
+        f_aubmc_24 = st.file_uploader("AUBMC 2024", type="csv", key="a24")
+        f_aubmc_25 = st.file_uploader("AUBMC 2025", type="csv", key="a25")
 
     with st.expander("Emergency Department", expanded=False):
-        f_ed_23 = st.file_uploader("ED 2023", type="csv", key="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")
-        f_ed_24 = st.file_uploader("ED 2024", type="csv", key="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")
-        f_ed_25 = st.file_uploader("ED 2025", type="csv", key="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")
+        f_ed_23 = st.file_uploader("ED 2023", type="csv", key="e23")
+        f_ed_24 = st.file_uploader("ED 2024", type="csv", key="e24")
+        f_ed_25 = st.file_uploader("ED 2025", type="csv", key="e25")
 
     with st.expander("Pathology & Lab", expanded=False):
-        f_patho_23 = st.file_uploader("Patho 2023", type="csv", key="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")
-        f_patho_24 = st.file_uploader("Patho 2024", type="csv", key="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")
-        f_patho_25 = st.file_uploader("Patho 2025", type="csv", key="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")
+        f_patho_23 = st.file_uploader("Patho 2023", type="csv", key="p23")
+        f_patho_24 = st.file_uploader("Patho 2024", type="csv", key="p24")
+        f_patho_25 = st.file_uploader("Patho 2025", type="csv", key="p25")
 
     st.markdown("---")
     st.markdown("### 🔧 Settings")
@@ -247,11 +257,11 @@ with st.sidebar:
     sent_thresh = st.slider("VADER negative threshold", -0.5, 0.0, -0.05, 0.01,
                             help="Compound score ≤ this value = NEGATIVE")
     st.markdown("---")
-    st.markdown("**v4.0 · VADER Sentiment**  \n*All IDs anonymised*", unsafe_allow_html=True)
+    st.markdown("**v5.0 · VADER Sentiment**  \n*All IDs anonymised*", unsafe_allow_html=True)
 
 # ─── DATA LOADING ────────────────────────────────────────────────────────────
-@st.cache_data
-def load_and_process(files_aubmc, files_ed, files_patho, min_f, threshold):
+@st.cache_data(show_spinner=False)
+def load_and_process(files_aubmc, files_ed, files_patho, min_f, threshold, _version="v5.0"):
     depts = {}
 
     def load_dept(file_list, name):
@@ -293,10 +303,10 @@ if not any_uploaded:
         <div class="metric-card">
             <div class="metric-label">Methodology</div>
             <div style="margin-top:8px; font-size:14px; color:#374151; line-height:1.6">
-                📊 Funnel Plot (95% LCL)<br>
                 📏 IQR Outlier Detection<br>
                 📉 Z-Score Analysis<br>
-                🔢 Bottom 10% Threshold
+                🔢 Bottom 10% Threshold<br>
+                🔗 Complaints × Sentiment
             </div>
         </div>""", unsafe_allow_html=True)
     with c2:
@@ -333,7 +343,8 @@ with st.spinner("Processing data and running VADER sentiment analysis..."):
         tuple(f for f in files_ed),
         tuple(f for f in files_patho),
         min_forms,
-        sent_thresh
+        sent_thresh,
+        _version="v5.0"
     )
 
 # Build combined physician table from available departments
@@ -358,10 +369,10 @@ st.markdown("---")
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📋 Executive Summary",
     "🎯 Flagged Physicians",
-    "📊 Department View",
+    "📊 Project View",
     "💬 Sentiment Explorer",
     "📈 Trends (2023–2025)",
-    "🤖 Ask the Data"
+    "🏢 Departments & Divisions"
 ])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -371,13 +382,13 @@ with tab1:
     st.markdown('<div class="section-header">🔑 Key Performance Indicators</div>', unsafe_allow_html=True)
 
     total      = len(all_phys)
-    priority   = (all_phys["risk_score"] == 2).sum()
-    monitor    = (all_phys["risk_score"] == 1).sum()
+    priority   = (all_phys["risk_score"] >= 3).sum()
+    monitor    = (all_phys["risk_score"].between(1, 2)).sum()
     clear      = (all_phys["risk_score"] == 0).sum()
     avg_score  = all_phys["avg_behavior_score"].mean()
     pct_neg    = (all_phys["negative_outlier"] == True).sum()
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
         st.markdown(f"""<div class="metric-card neutral">
             <div class="metric-label">Total Physicians</div>
@@ -409,54 +420,115 @@ with tab1:
             <div class="metric-value">{avg_score:.2f}</div>
             <div class="metric-sub">scale: 0 – 4</div>
         </div>""", unsafe_allow_html=True)
+    with c6:
+        st.markdown(f"""<div class="metric-card {'danger' if pct_neg > 0 else 'success'}">
+            <div class="metric-label">Neg. Sentiment Flags</div>
+            <div class="metric-value">{pct_neg}</div>
+            <div class="metric-sub">{pct_neg/total*100:.1f}% of physicians</div>
+        </div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    col_left, col_right = st.columns([1.2, 1])
+    # ── Risk Score — big and prominent ───────────────────────────────────────
+    st.markdown('<div class="section-header">🎯 Risk Score Breakdown</div>', unsafe_allow_html=True)
+    risk_vals = [
+        int((all_phys["risk_score"] == 0).sum()),
+        int(all_phys["risk_score"].between(1, 2).sum()),
+        int((all_phys["risk_score"] >= 3).sum()),
+    ]
+    total_phys_r = sum(risk_vals)
+    fig_risk, ax_risk = plt.subplots(figsize=(10, 4.5))
+    risk_labels_r = ["Clear (0)", "Monitor (1–2)", "Priority (3–4)"]
+    risk_colors_r = ["#10b981", "#f59e0b", "#ef4444"]
+    bars_r = ax_risk.bar(risk_labels_r, risk_vals, color=risk_colors_r,
+                         edgecolor="white", linewidth=2, width=0.45)
+    for bar, val in zip(bars_r, risk_vals):
+        pct = val / total_phys_r * 100 if total_phys_r > 0 else 0
+        ax_risk.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                     str(val), ha="center", va="bottom", fontweight="900", fontsize=24, color="#1f2937")
+        if val > 0:
+            ax_risk.text(bar.get_x() + bar.get_width()/2, bar.get_height()/2,
+                         f"{pct:.1f}%", ha="center", va="center",
+                         fontweight="700", fontsize=15, color="white")
+    ax_risk.set_ylabel("Number of Physicians", fontsize=12)
+    ax_risk.set_title("Composite Risk Distribution — All Physicians", fontsize=14, fontweight="bold", pad=14)
+    ax_risk.tick_params(axis="x", labelsize=14)
+    ax_risk.grid(axis="y", alpha=0.3, linestyle="--")
+    ax_risk.set_facecolor("#fafafa"); fig_risk.patch.set_facecolor("white")
+    ax_risk.spines["top"].set_visible(False); ax_risk.spines["right"].set_visible(False)
+    plt.tight_layout(); st.pyplot(fig_risk, use_container_width=True); plt.close()
 
-    with col_left:
-        st.markdown('<div class="section-header">Department Score Comparison</div>', unsafe_allow_html=True)
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        dept_data  = [data[d][1]["avg_behavior_score"] for d in available_depts]
-        colours    = ["#3b82f6","#f59e0b","#10b981","#8b5cf6"][:len(available_depts)]
-        bp = ax.boxplot(dept_data, patch_artist=True, notch=False,
-                        medianprops=dict(color="white", linewidth=2.5))
-        for patch, col in zip(bp["boxes"], colours):
-            patch.set_facecolor(col); patch.set_alpha(0.8)
-        ax.set_xticks(range(1, len(available_depts)+1))
-        ax.set_xticklabels(available_depts, fontsize=11)
-        ax.set_ylabel("Avg Behaviour Score (0–4)", fontsize=10)
-        ax.set_title("Score Distribution by Department", fontsize=12, fontweight="bold", pad=10)
-        ax.grid(axis="y", alpha=0.3, linestyle="--")
-        ax.set_facecolor("#fafafa")
-        fig.patch.set_facecolor("white")
-        st.pyplot(fig, use_container_width=True)
-        plt.close()
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    with col_right:
-        st.markdown('<div class="section-header">Risk Score Breakdown</div>', unsafe_allow_html=True)
-        fig2, ax2 = plt.subplots(figsize=(5, 4.5))
-        risk_counts = all_phys["risk_score"].value_counts().sort_index()
-        bar_labels  = {0:"Clear (0)", 1:"Monitor (1)", 2:"Priority (2)"}
-        bar_colors  = {0:"#10b981", 1:"#f59e0b", 2:"#ef4444"}
-        bars = ax2.bar(
-            [bar_labels.get(i, str(i)) for i in risk_counts.index],
-            risk_counts.values,
-            color=[bar_colors.get(i,"#6366f1") for i in risk_counts.index],
-            edgecolor="white", linewidth=1.5, width=0.55
-        )
-        for bar, val in zip(bars, risk_counts.values):
-            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
-                     str(val), ha="center", va="bottom", fontweight="700", fontsize=12)
-        ax2.set_ylabel("Number of Physicians", fontsize=10)
-        ax2.set_title("Composite Risk Distribution", fontsize=12, fontweight="bold", pad=10)
-        ax2.grid(axis="y", alpha=0.3, linestyle="--")
-        ax2.set_facecolor("#fafafa")
-        fig2.patch.set_facecolor("white")
-        ax2.spines["top"].set_visible(False)
-        ax2.spines["right"].set_visible(False)
-        st.pyplot(fig2, use_container_width=True)
-        plt.close()
+    # ── Outlier Detection Methods — 3 histograms ──────────────────────────────
+    st.markdown('<div class="section-header">📊 Outlier Detection Methods</div>', unsafe_allow_html=True)
+    scores_all = all_phys["avg_behavior_score"].dropna()
+    Q1g, Q3g   = scores_all.quantile(0.25), scores_all.quantile(0.75)
+    iqr_fence  = Q1g - 1.5 * (Q3g - Q1g)
+    bot10_val  = scores_all.quantile(0.10)
+    n_iqr = int(all_phys["low_iqr_outlier"].sum()) if "low_iqr_outlier" in all_phys.columns else 0
+    n_z   = int(all_phys["low_z_outlier"].sum())   if "low_z_outlier"   in all_phys.columns else 0
+    n_bot = int(all_phys["low_bottom10"].sum())    if "low_bottom10"    in all_phys.columns else 0
+
+    v1, v2, v3 = st.columns(3)
+    with v1:
+        st.caption(f"**IQR Lower Fence** — {n_iqr} flagged")
+        fig1, ax1 = plt.subplots(figsize=(4, 3))
+        mask_iqr = all_phys["low_iqr_outlier"].fillna(False).astype(bool)
+        ax1.hist(all_phys[~mask_iqr]["avg_behavior_score"].dropna(), bins=20, color="#3b82f6", alpha=0.7, label=f"Normal ({(~mask_iqr).sum()})")
+        ax1.hist(all_phys[mask_iqr]["avg_behavior_score"].dropna(),  bins=8,  color="#ef4444", alpha=0.9, label=f"Flagged ({mask_iqr.sum()})")
+        ax1.axvline(iqr_fence, color="#ef4444", linestyle="--", linewidth=1.8, label=f"Fence ({iqr_fence:.2f})")
+        ax1.set_title("IQR Outliers", fontsize=10, fontweight="bold")
+        ax1.set_xlabel("Avg Score", fontsize=8); ax1.set_ylabel("Count", fontsize=8)
+        ax1.legend(fontsize=7); ax1.grid(axis="y", alpha=0.25, linestyle="--")
+        ax1.set_facecolor("#fafafa"); fig1.patch.set_facecolor("white")
+        plt.tight_layout(); st.pyplot(fig1, use_container_width=True); plt.close()
+
+    with v2:
+        st.caption(f"**Z-Score ≤ −2** — {n_z} flagged")
+        fig2, ax2 = plt.subplots(figsize=(4, 3))
+        mask_z = all_phys["low_z_outlier"].fillna(False).astype(bool) if "low_z_outlier" in all_phys.columns else pd.Series(False, index=all_phys.index)
+        ax2.hist(all_phys[~mask_z]["z_score"].dropna(), bins=20, color="#3b82f6", alpha=0.7, label=f"Normal ({(~mask_z).sum()})")
+        ax2.hist(all_phys[mask_z]["z_score"].dropna(),  bins=8,  color="#f59e0b", alpha=0.9, label=f"Flagged ({mask_z.sum()})")
+        ax2.axvline(-2, color="#f59e0b", linestyle="--", linewidth=1.8, label="Z = −2")
+        ax2.set_title("Z-Score Outliers", fontsize=10, fontweight="bold")
+        ax2.set_xlabel("Z-Score", fontsize=8); ax2.set_ylabel("Count", fontsize=8)
+        ax2.legend(fontsize=7); ax2.grid(axis="y", alpha=0.25, linestyle="--")
+        ax2.set_facecolor("#fafafa"); fig2.patch.set_facecolor("white")
+        plt.tight_layout(); st.pyplot(fig2, use_container_width=True); plt.close()
+
+    with v3:
+        st.caption(f"**Bottom 10%** — {n_bot} flagged")
+        fig3, ax3 = plt.subplots(figsize=(4, 3))
+        mask_b = all_phys["low_bottom10"].fillna(False).astype(bool) if "low_bottom10" in all_phys.columns else pd.Series(False, index=all_phys.index)
+        ax3.hist(all_phys[~mask_b]["avg_behavior_score"].dropna(), bins=20, color="#3b82f6", alpha=0.7, label=f"Normal ({(~mask_b).sum()})")
+        ax3.hist(all_phys[mask_b]["avg_behavior_score"].dropna(),  bins=8,  color="#8b5cf6", alpha=0.9, label=f"Flagged ({mask_b.sum()})")
+        ax3.axvline(bot10_val, color="#8b5cf6", linestyle="--", linewidth=1.8, label=f"P10 ({bot10_val:.2f})")
+        ax3.set_title("Bottom 10% Outliers", fontsize=10, fontweight="bold")
+        ax3.set_xlabel("Avg Score", fontsize=8); ax3.set_ylabel("Count", fontsize=8)
+        ax3.legend(fontsize=7); ax3.grid(axis="y", alpha=0.25, linestyle="--")
+        ax3.set_facecolor("#fafafa"); fig3.patch.set_facecolor("white")
+        plt.tight_layout(); st.pyplot(fig3, use_container_width=True); plt.close()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Dept score box plot ───────────────────────────────────────────────────
+    st.markdown('<div class="section-header">🏥 Department Score Comparison</div>', unsafe_allow_html=True)
+    fig_d, ax_d = plt.subplots(figsize=(10, 4))
+    dept_data = [data[d][1]["avg_behavior_score"] for d in available_depts]
+    colours   = ["#3b82f6","#f59e0b","#10b981","#8b5cf6"][:len(available_depts)]
+    bp = ax_d.boxplot(dept_data, patch_artist=True, notch=False,
+                      medianprops=dict(color="white", linewidth=2.5))
+    for patch, col in zip(bp["boxes"], colours):
+        patch.set_facecolor(col); patch.set_alpha(0.8)
+    ax_d.set_xticks(range(1, len(available_depts)+1))
+    ax_d.set_xticklabels(available_depts, fontsize=11)
+    ax_d.set_ylabel("Avg Behaviour Score (0–4)", fontsize=10)
+    ax_d.set_title("Score Distribution by Department", fontsize=12, fontweight="bold", pad=10)
+    ax_d.grid(axis="y", alpha=0.3, linestyle="--")
+    ax_d.set_facecolor("#fafafa"); fig_d.patch.set_facecolor("white")
+    plt.tight_layout(); st.pyplot(fig_d, use_container_width=True); plt.close()
+
 
     st.markdown('<div class="section-header">Department Summary Table</div>', unsafe_allow_html=True)
     summary_rows = []
@@ -467,11 +539,10 @@ with tab1:
             "Department":      dept,
             "Physicians":      len(phys),
             "Avg Score":       f"{phys['avg_behavior_score'].mean():.2f}",
-            "Priority (2)":    int((phys['risk_score']==2).sum()),
-            "Monitor (1)":     int((phys['risk_score']==1).sum()),
+            "Priority (3-4)":  int((phys['risk_score']>=3).sum()),
+            "Monitor (1-2)":   int((phys['risk_score'].between(1,2)).sum()),
             "Clear (0)":       int((phys['risk_score']==0).sum()),
-            "Funnel Outliers": int(phys['low_funnel_outlier'].sum()),
-            "Sentiment Flags": int(phys['negative_outlier'].sum()),
+            "Sentiment Flags": int(phys['negative_outlier'].sum()) if 'negative_outlier' in phys.columns else 0,
         }
         summary_rows.append(row)
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
@@ -487,17 +558,17 @@ with tab2:
     with col_f1:
         dept_filter = st.selectbox("Department", ["All"] + available_depts, key="flag_dept")
     with col_f2:
-        risk_filter = st.selectbox("Risk Level", ["All","Priority (2)","Monitor (1)","Clear (0)"], key="flag_risk")
+        risk_filter = st.selectbox("Risk Level", ["All","Priority (3-4)","Monitor (1-2)","Clear (0)"], key="flag_risk")
     with col_f3:
         sort_by = st.selectbox("Sort by", ["Risk Score ↓", "Avg Score ↑", "Neg. Ratio ↓"], key="flag_sort")
 
     df_view = all_phys.copy()
     if dept_filter != "All":
         df_view = df_view[df_view["department"] == dept_filter]
-    if risk_filter == "Priority (2)":
-        df_view = df_view[df_view["risk_score"] == 2]
-    elif risk_filter == "Monitor (1)":
-        df_view = df_view[df_view["risk_score"] == 1]
+    if risk_filter == "Priority (3-4)":
+        df_view = df_view[df_view["risk_score"] >= 3]
+    elif risk_filter == "Monitor (1-2)":
+        df_view = df_view[df_view["risk_score"].between(1, 2)]
     elif risk_filter == "Clear (0)":
         df_view = df_view[df_view["risk_score"] == 0]
 
@@ -515,12 +586,10 @@ with tab2:
         "avg_behavior_score": "Avg Score",
         "n_forms":            "Evaluations",
         "z_score":            "Z-Score",
-        "low_funnel_outlier": "Funnel Flag",
         "low_iqr_outlier":    "IQR Flag",
         "low_z_outlier":      "Z-Flag",
-        "negative_ratio":     "Neg. Ratio",
-        "avg_compound":       "VADER Score",
-        "negative_outlier":   "Sentiment Flag",
+        "low_bottom10":       "Bottom 10%",
+        "negative_outlier":   "Neg. Sentiment",
         "risk_score":         "Risk Score",
     }
     show_df = df_view[[c for c in display_cols if c in df_view.columns]].copy()
@@ -531,8 +600,8 @@ with tab2:
         show_df["Z-Score"] = show_df["Z-Score"].round(2)
     if "Neg. Ratio" in show_df.columns:
         show_df["Neg. Ratio"] = show_df["Neg. Ratio"].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
-    if "VADER Score" in show_df.columns:
-        show_df["VADER Score"] = show_df["VADER Score"].apply(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
+    if "Avg Compound" in show_df.columns:
+        show_df["Avg Compound"] = show_df["Avg Compound"].apply(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
 
     st.dataframe(
         show_df.reset_index(drop=True),
@@ -540,7 +609,7 @@ with tab2:
         hide_index=True,
         column_config={
             "Risk Score": st.column_config.ProgressColumn(
-                "Risk Score", min_value=0, max_value=2, format="%d"
+                "Risk Score", min_value=0, max_value=4, format="%d"
             ),
             "Avg Score": st.column_config.ProgressColumn(
                 "Avg Score", min_value=0, max_value=4, format="%.3f"
@@ -557,45 +626,87 @@ with tab2:
     st.markdown("---")
     st.markdown('<div class="section-header">🔍 Individual Physician Deep-Dive</div>', unsafe_allow_html=True)
 
-    # Only show physicians that appear in the current filter
-    phys_options = df_view["physician_id"].tolist()
-    if phys_options:
-        selected_id = st.selectbox("Select Physician ID", phys_options, key="deep_id")
-        row = df_view[df_view["physician_id"] == selected_id].iloc[0]
+    dd1, dd2, dd3 = st.columns(3)
+    with dd1:
+        dd_dept = st.selectbox("Department", available_depts, key="deep_dept")
+    with dd2:
+        # Build year list from raw data for selected dept
+        raw_dd, phys_dd_all, sent_dd = data[dd_dept]
+        if raw_dd is not None and "year" in raw_dd.columns:
+            yr_opts = ["All Years"] + sorted(raw_dd["year"].dropna().unique().astype(int).tolist(), reverse=True)
+        else:
+            yr_opts = ["All Years"]
+        dd_year = st.selectbox("Year", yr_opts, key="deep_year")
+    with dd3:
+        # Filter physicians by dept (and year if selected)
+        if raw_dd is not None:
+            if dd_year == "All Years":
+                dd_raw_filt = raw_dd
+            else:
+                dd_raw_filt = raw_dd[raw_dd["year"] == int(dd_year)]
+            phys_in_yr = sorted(dd_raw_filt["physician_id"].dropna().unique().tolist())
+        else:
+            phys_in_yr = []
+        if phys_in_yr:
+            selected_id = st.selectbox("Physician ID", phys_in_yr, key="deep_id")
+        else:
+            selected_id = None
+            st.info("No physicians for this selection.")
 
-        dc1, dc2, dc3, dc4 = st.columns(4)
-        with dc1:
-            st.metric("Department", row.get("department","—"))
-        with dc2:
-            st.metric("Avg Behaviour Score", f"{row['avg_behavior_score']:.3f} / 4.0")
-        with dc3:
-            st.metric("Evaluations Received", int(row["n_forms"]))
-        with dc4:
-            st.metric("Composite Risk Score", f"{int(row['risk_score'])} / 2")
+    if selected_id and raw_dd is not None:
+        # Get aggregated row — use year-filtered data if year selected
+        if dd_year == "All Years":
+            phys_src = phys_dd_all
+        else:
+            yr_raw = raw_dd[raw_dd["year"] == int(dd_year)]
+            if not yr_raw.empty:
+                phys_src = aggregate_physician(yr_raw)
+                phys_src, _, _ = add_outlier_flags(phys_src)
+                # Re-merge 2025 sentiment for this year's risk computation
+                if sent_dd is not None and not sent_dd.empty and int(dd_year) == 2025:
+                    sent_yr = sentiment_summary(sent_dd, min_comments=3)
+                    phys_src = merge_sentiment(phys_src, sent_yr)
+                else:
+                    phys_src["negative_outlier"] = False
+                phys_src = add_risk(phys_src)
+                phys_src["department"] = dd_dept
+            else:
+                phys_src = phys_dd_all
 
-        dc5, dc6, dc7, dc8 = st.columns(4)
-        with dc5:
-            st.metric("Z-Score", f"{row.get('z_score', 0):.2f}")
-        with dc6:
-            funnel = "🔴 FLAGGED" if row.get("low_funnel_outlier", False) else "🟢 Clear"
-            st.metric("Funnel Plot", funnel)
-        with dc7:
-            neg_r = row.get("negative_ratio", np.nan)
-            st.metric("Neg. Comment Ratio", f"{neg_r:.1%}" if pd.notna(neg_r) else "—")
-        with dc8:
-            vader_s = row.get("avg_compound", np.nan)
-            st.metric("VADER Compound", f"{vader_s:.3f}" if pd.notna(vader_s) else "—")
+        row_mask = phys_src["physician_id"] == selected_id if phys_src is not None else pd.Series(False)
+        if phys_src is None or not row_mask.any():
+            st.warning(f"No data found for {selected_id}.")
+        else:
+            row = phys_src[row_mask].iloc[0]
+            year_label = f" — {dd_year}" if dd_year != "All Years" else " — All Years"
 
-        # Show this physician's comments
-        dept_name = row.get("department","AUBMC")
-        if dept_name in data:
-            _, _, sent_raw = data[dept_name]
-            if sent_raw is not None and not sent_raw.empty and "physician_id" in sent_raw.columns:
-                phys_comments = sent_raw[sent_raw["physician_id"] == selected_id].copy()
+            dc1, dc2, dc3, dc4 = st.columns(4)
+            with dc1: st.metric("Department", dd_dept)
+            with dc2: st.metric(f"Avg Score{year_label}", f"{row['avg_behavior_score']:.3f} / 4.0")
+            with dc3: st.metric("Evaluations", int(row["n_forms"]))
+            with dc4: st.metric("Risk Score (0–4)", f"{int(row['risk_score'])} / 4")
+
+            dc5, dc6, dc7, dc8 = st.columns(4)
+            with dc5: st.metric("Z-Score", f"{row.get('z_score', 0):.2f}")
+            with dc6:
+                iqr_dd = "🔴 YES" if row.get("low_iqr_outlier", False) else "🟢 No"
+                st.metric("IQR Outlier", iqr_dd)
+            with dc7:
+                neg_r = row.get("negative_ratio", np.nan)
+                st.metric("Neg. Comment Ratio", f"{neg_r:.1%}" if pd.notna(neg_r) else "—")
+            with dc8:
+                neg_s = "🔴 YES" if row.get("negative_outlier", False) else "🟢 No"
+                st.metric("Neg. Sentiment", neg_s)
+
+            # Comments — filter by year if selected
+            if sent_dd is not None and not sent_dd.empty and "physician_id" in sent_dd.columns:
+                phys_comments = sent_dd[sent_dd["physician_id"] == selected_id].copy()
+                if dd_year != "All Years" and "year" in phys_comments.columns:
+                    phys_comments = phys_comments[phys_comments["year"] == int(dd_year)]
                 if not phys_comments.empty:
-                    st.markdown(f"**Comments for this physician** ({len(phys_comments)} total):")
-                    phys_comments_sorted = phys_comments.sort_values("compound")
-                    for _, crow in phys_comments_sorted.iterrows():
+                    yr_suffix = f", {dd_year}" if dd_year != "All Years" else ""
+                    st.markdown(f"**Peer Comments** ({len(phys_comments)} total{yr_suffix}):")
+                    for _, crow in phys_comments.sort_values("compound").iterrows():
                         css_class = "neg" if crow["sentiment"]=="NEGATIVE" else ("pos" if crow["sentiment"]=="POSITIVE" else "neu")
                         emoji     = "🔴" if crow["sentiment"]=="NEGATIVE" else ("🟢" if crow["sentiment"]=="POSITIVE" else "⚪")
                         year_str  = str(int(crow["year"])) if "year" in crow and pd.notna(crow.get("year")) else "—"
@@ -609,9 +720,10 @@ with tab2:
                             <div style="font-size:14px; color:#374151">{crow["comments"]}</div>
                         </div>""", unsafe_allow_html=True)
                 else:
-                    st.info("No comments available for this physician.")
-    else:
+                    st.info("No comments available for this selection.")
+    elif not selected_id:
         st.info("No physicians match the current filter.")
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -629,26 +741,31 @@ with tab3:
         d1, d2, d3, d4 = st.columns(4)
         with d1: st.metric("Physicians", len(phys_d))
         with d2: st.metric("Dept. Mean Score", f"{phys_d['avg_behavior_score'].mean():.3f}")
-        with d3: st.metric("Funnel Outliers", int(phys_d["low_funnel_outlier"].sum()))
-        with d4: st.metric("Priority Flags", int((phys_d["risk_score"]==2).sum()))
+        with d3: st.metric("IQR Outliers", int(phys_d["low_iqr_outlier"].sum()) if "low_iqr_outlier" in phys_d.columns else 0)
+        with d4: st.metric("Priority Flags", int((phys_d["risk_score"]>=3).sum()))
 
         col_l, col_r = st.columns(2)
 
-        # Funnel plot
+        # IQR scatter plot
         with col_l:
-            st.markdown("**Funnel Plot — Score vs. Evaluations**")
+            st.markdown("**IQR Outlier View — Score Distribution**")
             fig, ax = plt.subplots(figsize=(6, 4.5))
-            df_s = phys_d.sort_values("n_forms")
-            ax.scatter(df_s["n_forms"], df_s["avg_behavior_score"],
-                       alpha=0.6, color="#3b82f6", s=55, label="Physicians", zorder=3)
-            ax.plot(df_s["n_forms"], df_s["lower_funnel_95"],
-                    color="#ef4444", linewidth=2, linestyle="--", label="95% LCL")
-            outliers = df_s[df_s["low_funnel_outlier"]]
-            ax.scatter(outliers["n_forms"], outliers["avg_behavior_score"],
-                       color="#ef4444", s=100, zorder=5, label=f"Low Outliers (n={len(outliers)})")
-            ax.set_xlabel("Number of Evaluations", fontsize=10)
+            scores_d  = phys_d["avg_behavior_score"]
+            Q1d, Q3d  = scores_d.quantile(0.25), scores_d.quantile(0.75)
+            iqr_fence = Q1d - 1.5 * (Q3d - Q1d)
+            normal    = phys_d[~phys_d["low_iqr_outlier"]] if "low_iqr_outlier" in phys_d.columns else phys_d
+            outliers  = phys_d[phys_d["low_iqr_outlier"]]  if "low_iqr_outlier" in phys_d.columns else phys_d.iloc[0:0]
+            ax.scatter(normal.index,  normal["avg_behavior_score"],
+                       alpha=0.6, color="#3b82f6", s=55, label="Within range", zorder=3)
+            ax.scatter(outliers.index, outliers["avg_behavior_score"],
+                       color="#ef4444", s=100, zorder=5, label=f"IQR Outliers (n={len(outliers)})")
+            ax.axhline(iqr_fence, color="#ef4444", linewidth=2, linestyle="--",
+                       label=f"IQR Lower Fence ({iqr_fence:.2f})")
+            ax.axhline(scores_d.mean(), color="#1d4ed8", linewidth=1.5, linestyle=":",
+                       label=f"Mean ({scores_d.mean():.2f})")
+            ax.set_xlabel("Physician Index", fontsize=10)
             ax.set_ylabel("Avg Behaviour Score", fontsize=10)
-            ax.set_title(f"{dept_sel} Funnel Plot", fontsize=11, fontweight="bold")
+            ax.set_title(f"{dept_sel} — IQR Score Outliers", fontsize=11, fontweight="bold")
             ax.legend(fontsize=9)
             ax.grid(alpha=0.3, linestyle="--")
             ax.set_facecolor("#fafafa")
@@ -664,10 +781,11 @@ with tab3:
             n, bins, patches = ax2.hist(scores, bins=20, edgecolor="white",
                                          linewidth=0.8, color="#3b82f6", alpha=0.75)
 
-            # Colour funnel outliers red in the histogram
-            funnel_thresh = phys_d["lower_funnel_95"].min()
+            # Colour IQR outliers red in the histogram
+            Q1h, Q3h   = scores.quantile(0.25), scores.quantile(0.75)
+            iqr_thresh = Q1h - 1.5 * (Q3h - Q1h)
             for patch, left_edge in zip(patches, bins[:-1]):
-                if left_edge < funnel_thresh:
+                if left_edge < iqr_thresh:
                     patch.set_facecolor("#ef4444")
                     patch.set_alpha(0.8)
 
@@ -676,7 +794,7 @@ with tab3:
             ax2.axvline(scores.quantile(0.10), color="#f59e0b", linewidth=1.5,
                         linestyle=":", label=f"10th pct ({scores.quantile(.1):.2f})")
 
-            red_patch   = mpatches.Patch(color="#ef4444", alpha=0.8, label="Below funnel LCL")
+            red_patch   = mpatches.Patch(color="#ef4444", alpha=0.8, label="Below IQR fence")
             blue_patch  = mpatches.Patch(color="#3b82f6", alpha=0.75, label="Within range")
             ax2.legend(handles=[red_patch, blue_patch] +
                        [plt.Line2D([0],[0],color="#1d4ed8",linewidth=2,label=f"Mean ({scores.mean():.2f})"),
@@ -695,9 +813,9 @@ with tab3:
         # Outlier method comparison table
         st.markdown("**Outlier Method Comparison**")
         method_df = pd.DataFrame({
-            "Method":       ["Funnel Plot (95%)", "IQR Lower Fence", "Z-Score (≤−2)", "Bottom 10%"],
-            "Flag Column":  ["low_funnel_outlier","low_iqr_outlier","low_z_outlier","low_bottom10"],
-        })
+                "Method":       ["IQR Lower Fence", "Z-Score (≤−2)", "Bottom 10%", "Neg. Sentiment"],
+                "Flag Column":  ["low_iqr_outlier", "low_z_outlier", "low_bottom10", "negative_outlier"],
+            })
         method_df["Physicians Flagged"] = method_df["Flag Column"].apply(
             lambda c: int(phys_d[c].sum()) if c in phys_d.columns else 0
         )
@@ -709,18 +827,30 @@ with tab3:
 
         # Within-dept ranking table
         st.markdown("**Physician Ranking within Department**")
-        rank_df = phys_d[[
-            "physician_id","avg_behavior_score","n_forms","z_score",
-            "low_funnel_outlier","negative_outlier","risk_score"
-        ]].copy()
+        rank_cols = ["physician_id","avg_behavior_score","n_forms","z_score",
+                     "low_iqr_outlier","low_z_outlier","low_bottom10",
+                     "negative_outlier","risk_score"]
+        rank_cols = [c for c in rank_cols if c in phys_d.columns]
+        rank_df = phys_d[rank_cols].copy()
         rank_df = rank_df.sort_values("avg_behavior_score")
         rank_df["Percentile"] = (rank_df["avg_behavior_score"].rank(pct=True)*100).round(1).astype(str) + "%"
         rank_df["avg_behavior_score"] = rank_df["avg_behavior_score"].round(3)
-        rank_df["z_score"] = rank_df["z_score"].round(2)
-        rank_df.columns = ["Physician ID","Avg Score","Evaluations","Z-Score",
-                           "Funnel Flag","Sentiment Flag","Risk Score","Percentile"]
+        if "z_score" in rank_df.columns:
+            rank_df["z_score"] = rank_df["z_score"].round(2)
+        col_rename = {
+            "physician_id":       "Physician ID",
+            "avg_behavior_score": "Avg Score",
+            "n_forms":            "Evaluations",
+            "z_score":            "Z-Score",
+            "low_iqr_outlier":    "IQR Flag",
+            "low_z_outlier":      "Z-Flag",
+            "low_bottom10":       "Bottom 10%",
+            "negative_outlier":   "Neg. Sentiment",
+            "risk_score":         "Risk Score",
+        }
+        rank_df = rank_df.rename(columns={k:v for k,v in col_rename.items() if k in rank_df.columns})
         st.dataframe(rank_df.reset_index(drop=True), use_container_width=True, hide_index=True,
-                     column_config={"Risk Score": st.column_config.ProgressColumn(min_value=0, max_value=2, format="%d"),
+                     column_config={"Risk Score": st.column_config.ProgressColumn(min_value=0, max_value=4, format="%d"),
                                     "Avg Score":  st.column_config.ProgressColumn(min_value=0, max_value=4, format="%.3f")})
 
 
@@ -728,99 +858,157 @@ with tab3:
 # TAB 4 — SENTIMENT EXPLORER
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab4:
-    st.markdown('<div class="section-header">💬 VADER Sentiment Explorer</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">💬 Sentiment Analysis</div>', unsafe_allow_html=True)
 
-    sent_dept = st.selectbox("Department", available_depts, key="sent_dept")
-    _, _, sent_raw = data[sent_dept]
+    # Gather sentiment data across all departments
+    sent_frames = []
+    for dn in available_depts:
+        _, _, sr = data[dn]
+        if sr is not None and not sr.empty:
+            sr2 = sr.copy()
+            sr2["dept"] = dn
+            sent_frames.append(sr2)
 
-    if sent_raw is None or sent_raw.empty:
-        st.info("No comment data available for this department.")
+    if not sent_frames:
+        st.info("No comment data available. Upload behaviour survey CSVs to enable sentiment analysis.")
     else:
+        all_sent = pd.concat(sent_frames, ignore_index=True)
+
+        # ── KPI row ───────────────────────────────────────────────────────────
         sc1, sc2, sc3, sc4 = st.columns(4)
-        total_comments  = len(sent_raw)
-        neg_count       = (sent_raw["sentiment"] == "NEGATIVE").sum()
-        pos_count       = (sent_raw["sentiment"] == "POSITIVE").sum()
-        neu_count       = (sent_raw["sentiment"] == "NEUTRAL").sum()
-        with sc1: st.metric("Total Comments", total_comments)
-        with sc2: st.metric("🔴 Negative", f"{neg_count} ({neg_count/total_comments*100:.1f}%)")
-        with sc3: st.metric("🟢 Positive", f"{pos_count} ({pos_count/total_comments*100:.1f}%)")
-        with sc4: st.metric("⚪ Neutral", f"{neu_count} ({neu_count/total_comments*100:.1f}%)")
+        total_c = len(all_sent)
+        neg_c   = (all_sent["sentiment"] == "NEGATIVE").sum()
+        pos_c   = (all_sent["sentiment"] == "POSITIVE").sum()
+        neu_c   = (all_sent["sentiment"] == "NEUTRAL").sum()
+        with sc1: st.metric("Total Comments", f"{total_c:,}")
+        with sc2: st.metric("🔴 Negative", f"{neg_c:,} ({neg_c/total_c*100:.1f}%)")
+        with sc3: st.metric("🟢 Positive", f"{pos_c:,} ({pos_c/total_c*100:.1f}%)")
+        with sc4: st.metric("⚪ Neutral",  f"{neu_c:,} ({neu_c/total_c*100:.1f}%)")
 
-        col_sl, col_sr = st.columns(2)
-
-        # Compound score histogram
-        with col_sl:
-            st.markdown("**VADER Compound Score Distribution**")
-            fig, ax = plt.subplots(figsize=(6, 4))
-            compounds = sent_raw["compound"].dropna()
-            n, bins, patches = ax.hist(compounds, bins=30, edgecolor="white", linewidth=0.5)
-            for patch, left in zip(patches, bins[:-1]):
-                if left <= -0.05:   patch.set_facecolor("#ef4444"); patch.set_alpha(0.8)
-                elif left >= 0.05:  patch.set_facecolor("#10b981"); patch.set_alpha(0.8)
-                else:               patch.set_facecolor("#9ca3af"); patch.set_alpha(0.7)
-            ax.axvline(-0.05, color="#ef4444", linestyle="--", linewidth=1.2, label="Neg threshold")
-            ax.axvline(+0.05, color="#10b981", linestyle="--", linewidth=1.2, label="Pos threshold")
-            ax.set_xlabel("Compound Score (−1 = very negative, +1 = very positive)", fontsize=9)
-            ax.set_ylabel("Comment Count", fontsize=9)
-            ax.set_title(f"{sent_dept} — VADER Compound Distribution", fontsize=11, fontweight="bold")
-            ax.legend(fontsize=8)
-            ax.grid(alpha=0.3, linestyle="--")
-            ax.set_facecolor("#fafafa")
-            fig.patch.set_facecolor("white")
-            st.pyplot(fig, use_container_width=True)
-            plt.close()
-
-        # Physician negative ratio scatter
-        with col_sr:
-            st.markdown("**Negative Ratio per Physician**")
-            sent_s = sentiment_summary(sent_raw)
-            fig2, ax2 = plt.subplots(figsize=(6, 4))
-            ax2.scatter(sent_s["total_comments"], sent_s["negative_ratio"],
-                        alpha=0.6, color="#3b82f6", s=50, label="Physicians")
-            flagged_s = sent_s[sent_s["negative_outlier"]]
-            ax2.scatter(flagged_s["total_comments"], flagged_s["negative_ratio"],
-                        color="#ef4444", s=90, zorder=5, label=f"Sentiment Outliers (n={len(flagged_s)})")
-            ax2.set_xlabel("Number of Comments", fontsize=9)
-            ax2.set_ylabel("Negative Comment Ratio", fontsize=9)
-            ax2.set_title(f"{sent_dept} — Negative Ratio by Physician", fontsize=11, fontweight="bold")
-            ax2.legend(fontsize=8)
-            ax2.grid(alpha=0.3, linestyle="--")
-            ax2.set_facecolor("#fafafa")
-            fig2.patch.set_facecolor("white")
-            st.pyplot(fig2, use_container_width=True)
-            plt.close()
-
-        # Comment browser
         st.markdown("---")
-        st.markdown("**Comment Browser**")
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            sentiment_filter = st.selectbox("Filter by Sentiment", ["All","NEGATIVE","POSITIVE","NEUTRAL"], key="sent_filter")
-        with cc2:
-            min_conf = st.slider("Min. VADER confidence (|compound|)", 0.0, 1.0, 0.0, 0.05, key="sent_conf")
 
-        display_sent = sent_raw.copy()
-        if sentiment_filter != "All":
-            display_sent = display_sent[display_sent["sentiment"] == sentiment_filter]
-        display_sent = display_sent[display_sent["compound"].abs() >= min_conf]
-        display_sent = display_sent.sort_values("compound")
+        # ── Chart 1: Sentiment breakdown by department (stacked bar) ─────────
+        st.markdown('<div class="section-header">📊 Sentiment Breakdown by Department</div>', unsafe_allow_html=True)
 
-        st.markdown(f"Showing **{len(display_sent)}** comments")
-        for _, crow in display_sent.head(50).iterrows():
-            css  = "neg" if crow["sentiment"]=="NEGATIVE" else ("pos" if crow["sentiment"]=="POSITIVE" else "neu")
-            emo  = "🔴" if crow["sentiment"]=="NEGATIVE" else ("🟢" if crow["sentiment"]=="POSITIVE" else "⚪")
-            yr   = str(int(crow["year"])) if "year" in crow and pd.notna(crow.get("year")) else "—"
-            rg   = crow.get("raters_group","—")
-            pid  = crow.get("physician_id","—")
-            st.markdown(f"""
-            <div class="comment-card {css}">
-                <div style="font-size:11px; color:#9ca3af; margin-bottom:5px">
-                    {emo} <b>{crow["sentiment"]}</b> &nbsp;·&nbsp; Compound: <b>{crow["compound"]:.3f}</b>
-                    &nbsp;·&nbsp; Physician: <b>{pid}</b>
-                    &nbsp;·&nbsp; Year: {yr} &nbsp;·&nbsp; {rg}
-                </div>
-                <div style="font-size:13px; color:#374151">{crow["comments"]}</div>
-            </div>""", unsafe_allow_html=True)
+        dept_sent = (
+            all_sent.groupby(["dept","sentiment"], as_index=False)
+            .size()
+            .rename(columns={"size":"count"})
+        )
+        dept_totals = dept_sent.groupby("dept")["count"].transform("sum")
+        dept_sent["pct"] = dept_sent["count"] / dept_totals * 100
+
+        depts_order  = dept_sent.groupby("dept")["count"].sum().sort_values(ascending=False).index.tolist()
+        neg_pct  = dept_sent[dept_sent["sentiment"]=="NEGATIVE"].set_index("dept")["pct"].reindex(depts_order).fillna(0)
+        pos_pct  = dept_sent[dept_sent["sentiment"]=="POSITIVE"].set_index("dept")["pct"].reindex(depts_order).fillna(0)
+        neu_pct  = dept_sent[dept_sent["sentiment"]=="NEUTRAL"].set_index("dept")["pct"].reindex(depts_order).fillna(0)
+        neg_cnt  = dept_sent[dept_sent["sentiment"]=="NEGATIVE"].set_index("dept")["count"].reindex(depts_order).fillna(0)
+        pos_cnt  = dept_sent[dept_sent["sentiment"]=="POSITIVE"].set_index("dept")["count"].reindex(depts_order).fillna(0)
+
+        fig_sb, ax_sb = plt.subplots(figsize=(10, max(4, len(depts_order)*0.45)))
+        y = range(len(depts_order))
+        b1 = ax_sb.barh(list(y), neg_pct.values, color="#ef4444", alpha=0.85, label="Negative")
+        b2 = ax_sb.barh(list(y), neu_pct.values, left=neg_pct.values, color="#9ca3af", alpha=0.75, label="Neutral")
+        b3 = ax_sb.barh(list(y), pos_pct.values, left=(neg_pct+neu_pct).values, color="#10b981", alpha=0.85, label="Positive")
+
+        # Annotate negative % on each bar
+        for i, (np_, nc) in enumerate(zip(neg_pct.values, neg_cnt.values)):
+            if np_ > 3:
+                ax_sb.text(np_/2, i, f"{np_:.1f}%", va="center", ha="center",
+                           fontsize=8, fontweight="700", color="white")
+
+        ax_sb.set_yticks(list(y))
+        ax_sb.set_yticklabels(depts_order, fontsize=9)
+        ax_sb.set_xlabel("% of Comments", fontsize=10)
+        ax_sb.set_title("Sentiment Breakdown by Department (% of comments)", fontsize=12, fontweight="bold")
+        ax_sb.axvline(100, color="#e5e7eb", linewidth=0.8)
+        ax_sb.legend(fontsize=9, loc="lower right")
+        ax_sb.set_xlim(0, 100)
+        ax_sb.grid(axis="x", alpha=0.25, linestyle="--")
+        ax_sb.set_facecolor("#fafafa")
+        fig_sb.patch.set_facecolor("white")
+        plt.tight_layout()
+        st.pyplot(fig_sb, use_container_width=True)
+        plt.close()
+
+        st.markdown("---")
+
+        # ── Chart 2: Yearly sentiment trend (2023-2025) ───────────────────────
+        st.markdown('<div class="section-header">📈 Yearly Sentiment Trend (2023–2025)</div>', unsafe_allow_html=True)
+
+        trend_dept_sent = st.selectbox("Filter by Department", ["All Departments"] + available_depts, key="sent_trend_dept")
+        df_trend_sent = all_sent if trend_dept_sent == "All Departments" else all_sent[all_sent["dept"] == trend_dept_sent]
+
+        if "year" not in df_trend_sent.columns or df_trend_sent["year"].isna().all():
+            st.warning("Year data not available in sentiment data.")
+        else:
+            yr_sent = (
+                df_trend_sent.groupby(["year","sentiment"], as_index=False)
+                .size()
+                .rename(columns={"size":"count"})
+            )
+            yr_totals = yr_sent.groupby("year")["count"].transform("sum")
+            yr_sent["pct"] = yr_sent["count"] / yr_totals * 100
+            years_s = sorted(df_trend_sent["year"].dropna().unique().astype(int))
+
+            neg_yr = yr_sent[yr_sent["sentiment"]=="NEGATIVE"].set_index("year")["pct"].reindex(years_s).fillna(0)
+            pos_yr = yr_sent[yr_sent["sentiment"]=="POSITIVE"].set_index("year")["pct"].reindex(years_s).fillna(0)
+            neu_yr = yr_sent[yr_sent["sentiment"]=="NEUTRAL"].set_index("year")["pct"].reindex(years_s).fillna(0)
+            total_yr = yr_sent.groupby("year")["count"].sum().reindex(years_s).fillna(0)
+
+            fig_yr, (ax_yr1, ax_yr2) = plt.subplots(1, 2, figsize=(12, 4.5))
+
+            # Left: stacked bar by year
+            w = 0.5
+            x = range(len(years_s))
+            ax_yr1.bar(x, neg_yr.values, width=w, color="#ef4444", alpha=0.85, label="Negative")
+            ax_yr1.bar(x, neu_yr.values, width=w, bottom=neg_yr.values, color="#9ca3af", alpha=0.75, label="Neutral")
+            ax_yr1.bar(x, pos_yr.values, width=w, bottom=(neg_yr+neu_yr).values, color="#10b981", alpha=0.85, label="Positive")
+            for xi, np_ in zip(x, neg_yr.values):
+                ax_yr1.text(xi, np_/2, f"{np_:.1f}%", ha="center", va="center",
+                            fontsize=9, fontweight="700", color="white")
+            ax_yr1.set_xticks(list(x))
+            ax_yr1.set_xticklabels([str(y) for y in years_s], fontsize=10)
+            ax_yr1.set_ylabel("% of Comments", fontsize=10)
+            ax_yr1.set_title("Sentiment Mix by Year", fontsize=11, fontweight="bold")
+            ax_yr1.legend(fontsize=9)
+            ax_yr1.set_ylim(0, 100)
+            ax_yr1.grid(axis="y", alpha=0.3, linestyle="--")
+            ax_yr1.set_facecolor("#fafafa")
+
+            # Right: negative % trend line
+            ax_yr2.plot(years_s, neg_yr.values, color="#ef4444", linewidth=2.5,
+                        marker="o", markersize=8, label="Negative %")
+            ax_yr2.plot(years_s, pos_yr.values, color="#10b981", linewidth=2.5,
+                        marker="s", markersize=8, label="Positive %")
+            for yr_v, nv, pv in zip(years_s, neg_yr.values, pos_yr.values):
+                ax_yr2.annotate(f"{nv:.1f}%", (yr_v, nv), textcoords="offset points",
+                                xytext=(0, 10), ha="center", fontsize=9, color="#ef4444", fontweight="700")
+                ax_yr2.annotate(f"{pv:.1f}%", (yr_v, pv), textcoords="offset points",
+                                xytext=(0,-15), ha="center", fontsize=9, color="#10b981", fontweight="700")
+            ax_yr2.set_xticks(years_s)
+            ax_yr2.set_xticklabels([str(y) for y in years_s], fontsize=10)
+            ax_yr2.set_ylabel("% of Comments", fontsize=10)
+            ax_yr2.set_title("Negative vs Positive Trend", fontsize=11, fontweight="bold")
+            ax_yr2.legend(fontsize=9)
+            ax_yr2.grid(alpha=0.3, linestyle="--")
+            ax_yr2.set_facecolor("#fafafa")
+
+            fig_yr.patch.set_facecolor("white")
+            plt.tight_layout()
+            st.pyplot(fig_yr, use_container_width=True)
+            plt.close()
+
+            # Summary table
+            st.markdown("**Year-by-Year Summary**")
+            yr_table = pd.DataFrame({
+                "Year":             [str(y) for y in years_s],
+                "Total Comments":   total_yr.astype(int).values,
+                "Negative %":       neg_yr.round(1).values,
+                "Neutral %":        neu_yr.round(1).values,
+                "Positive %":       pos_yr.round(1).values,
+            })
+            st.dataframe(yr_table, use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -835,7 +1023,7 @@ with tab5:
         trend_dept = st.selectbox("Department", available_depts, key="trend_dept")
     raw_d, phys_d, _ = data[trend_dept]
 
-    if raw_d is None or "year" not in raw_d.columns or raw_d["year"].isna().all():
+    if raw_d is None or raw_d.empty or "year" not in raw_d.columns or raw_d["year"].isna().all():
         st.warning("Year data not available. Check that your files include a Fillout Date column.")
     else:
         years_avail = sorted(raw_d["year"].dropna().unique().astype(int))
@@ -865,8 +1053,8 @@ with tab5:
                     "Year":             yr,
                     "Physicians":       len(phys_yr),
                     "Avg Score":        round(phys_yr["avg_behavior_score"].mean(), 3),
-                    "Funnel Outliers":  int(phys_yr["low_funnel_outlier"].sum()),
-                    "% Flagged":        round(phys_yr["low_funnel_outlier"].mean()*100, 1),
+                    "IQR Outliers":     int(phys_yr["low_iqr_outlier"].sum()) if "low_iqr_outlier" in phys_yr.columns else 0,
+                    "% Flagged":        round(phys_yr["low_iqr_outlier"].mean()*100, 1) if "low_iqr_outlier" in phys_yr.columns else 0,
                     "Median Score":     round(phys_yr["avg_behavior_score"].median(), 3),
                     "Score Std":        round(phys_yr["avg_behavior_score"].std(), 3),
                 })
@@ -917,7 +1105,7 @@ with tab5:
                 plt.close()
 
             with col_t2:
-                st.markdown("**% Physicians Flagged by Funnel Plot**")
+                st.markdown("**% Physicians Flagged by IQR**")
                 fig2, ax2 = plt.subplots(figsize=(6, 4))
                 bar_cols = ["#10b981" if p < 10 else ("#f59e0b" if p < 20 else "#ef4444")
                             for p in trend_df["% Flagged"]]
@@ -929,8 +1117,8 @@ with tab5:
                              ha="center", va="bottom", fontsize=10, fontweight="700")
                 ax2.set_xticks(years_avail)
                 ax2.set_xlabel("Year", fontsize=10)
-                ax2.set_ylabel("% Physicians Below Funnel LCL", fontsize=10)
-                ax2.set_title(f"{trend_dept} — Flagged Rate Over Time", fontsize=11, fontweight="bold")
+                ax2.set_ylabel("% Physicians Below IQR Fence", fontsize=10)
+                ax2.set_title(f"{trend_dept} — IQR Flagged Rate Over Time", fontsize=11, fontweight="bold")
                 ax2.grid(axis="y", alpha=0.3, linestyle="--")
                 ax2.set_facecolor("#fafafa")
                 fig2.patch.set_facecolor("white")
@@ -938,25 +1126,6 @@ with tab5:
                 ax2.spines["right"].set_visible(False)
                 st.pyplot(fig2, use_container_width=True)
                 plt.close()
-
-            st.markdown("**Score Distribution by Year (Colleague Comparison)**")
-            fig3, ax3 = plt.subplots(figsize=(10, 4.5))
-            year_scores = [raw_d[raw_d["year"]==yr]["overall_score"].dropna() for yr in years_avail]
-            positions   = list(range(1, len(years_avail)+1))
-            bp = ax3.boxplot(year_scores, positions=positions, patch_artist=True,
-                              medianprops=dict(color="white", linewidth=2.5))
-            yr_colours = ["#3b82f6","#f59e0b","#10b981","#8b5cf6"]
-            for patch, col in zip(bp["boxes"], yr_colours[:len(years_avail)]):
-                patch.set_facecolor(col); patch.set_alpha(0.75)
-            ax3.set_xticks(positions)
-            ax3.set_xticklabels([str(y) for y in years_avail], fontsize=11)
-            ax3.set_ylabel("Form-Level Score (0–4)", fontsize=10)
-            ax3.set_title(f"{trend_dept} — Score Distribution Per Year (All Forms)", fontsize=12, fontweight="bold")
-            ax3.grid(axis="y", alpha=0.3, linestyle="--")
-            ax3.set_facecolor("#fafafa")
-            fig3.patch.set_facecolor("white")
-            st.pyplot(fig3, use_container_width=True)
-            plt.close()
 
             st.markdown("**Year-over-Year Summary Table**")
             st.dataframe(trend_df, use_container_width=True, hide_index=True)
@@ -1143,15 +1312,118 @@ with tab5:
 
                     # ── PEER COMPARISON ───────────────────────────────────────
                     st.markdown("---")
-                    st.markdown('<div class="section-header">👥 Peer Comparison — All Physicians in Department</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="section-header">👥 Peer Comparison — Department Distribution</div>', unsafe_allow_html=True)
 
-                    # Build full cross-physician trend table using all available years
+                    # Build per-year box plot data + selected physician dot
+                    bp1, bp2 = st.columns(2)
+
+                    with bp1:
+                        st.markdown("**Score Distribution by Year — Selected Physician vs Peers**")
+                        fig_bp, ax_bp = plt.subplots(figsize=(7, 5))
+
+                        box_data  = []
+                        positions = []
+                        sel_dots  = []
+
+                        for pos, yr in enumerate(years_avail):
+                            yr_dept_scores = raw_d[raw_d["year"] == yr]["overall_score"].dropna().tolist()
+                            if not yr_dept_scores:
+                                continue
+                            box_data.append(yr_dept_scores)
+                            positions.append(pos)
+
+                            # Selected physician dot for this year
+                            sel_yr = raw_d[(raw_d["year"] == yr) & (raw_d["physician_id"] == selected_phys)]["overall_score"].dropna()
+                            sel_dots.append((pos, sel_yr.mean() if not sel_yr.empty else np.nan))
+
+                        bp = ax_bp.boxplot(
+                            box_data, positions=positions, widths=0.5, patch_artist=True,
+                            boxprops=dict(facecolor="#dbeafe", color="#3b82f6", linewidth=1.5),
+                            medianprops=dict(color="#1d4ed8", linewidth=2.5),
+                            whiskerprops=dict(color="#6b7280", linewidth=1.2),
+                            capprops=dict(color="#6b7280", linewidth=1.5),
+                            flierprops=dict(marker="o", color="#9ca3af", alpha=0.4, markersize=4),
+                        )
+
+                        # Selected physician dot per year
+                        for pos, val in sel_dots:
+                            if not np.isnan(val):
+                                ax_bp.scatter(pos, val, color="#ef4444", s=120, zorder=10,
+                                              marker="D", label=f"▶ {selected_phys}" if pos == positions[0] else "")
+                                ax_bp.annotate(f"{val:.2f}", (pos, val),
+                                               textcoords="offset points", xytext=(10, 0),
+                                               fontsize=9, fontweight="700", color="#ef4444")
+
+                        ax_bp.set_xticks(positions)
+                        ax_bp.set_xticklabels([str(yr) for yr in years_avail[:len(positions)]], fontsize=11)
+                        ax_bp.set_ylabel("Avg Behaviour Score (0–4)", fontsize=10)
+                        ax_bp.set_ylim(0, 4.2)
+                        ax_bp.set_title(f"{trend_dept} — Score Distribution per Year", fontsize=11, fontweight="bold")
+                        ax_bp.legend(fontsize=9, loc="lower right")
+                        ax_bp.grid(axis="y", alpha=0.3, linestyle="--")
+                        ax_bp.set_facecolor("#fafafa")
+                        fig_bp.patch.set_facecolor("white")
+                        plt.tight_layout()
+                        st.pyplot(fig_bp, use_container_width=True)
+                        plt.close()
+
+                    with bp2:
+                        st.markdown("**Overall Score Distribution — Selected Physician vs All Peers**")
+                        fig_bp2, ax_bp2 = plt.subplots(figsize=(7, 5))
+
+                        all_dept_scores = raw_d["overall_score"].dropna().tolist()
+                        sel_overall = raw_d[raw_d["physician_id"] == selected_phys]["overall_score"].dropna()
+                        sel_mean = sel_overall.mean() if not sel_overall.empty else np.nan
+
+                        ax_bp2.boxplot(
+                            [all_dept_scores], positions=[0], widths=0.4, patch_artist=True,
+                            boxprops=dict(facecolor="#dbeafe", color="#3b82f6", linewidth=1.5),
+                            medianprops=dict(color="#1d4ed8", linewidth=2.5),
+                            whiskerprops=dict(color="#6b7280", linewidth=1.2),
+                            capprops=dict(color="#6b7280", linewidth=1.5),
+                            flierprops=dict(marker="o", color="#9ca3af", alpha=0.4, markersize=4),
+                        )
+
+                        if not np.isnan(sel_mean):
+                            ax_bp2.scatter(0, sel_mean, color="#ef4444", s=180, zorder=10,
+                                           marker="D", label=f"▶ {selected_phys} ({sel_mean:.3f})")
+                            ax_bp2.axhline(sel_mean, color="#ef4444", linestyle=":", linewidth=1.5, alpha=0.6)
+
+                        dept_median = np.median(all_dept_scores)
+                        dept_mean   = np.mean(all_dept_scores)
+                        ax_bp2.axhline(dept_mean, color="#1d4ed8", linestyle="--", linewidth=1.5,
+                                       label=f"Dept mean ({dept_mean:.3f})", alpha=0.8)
+
+                        # Percentile of selected physician
+                        if not np.isnan(sel_mean):
+                            pct = (np.array(all_dept_scores) < sel_mean).mean() * 100
+                            ax_bp2.text(0.3, sel_mean, f"{pct:.0f}th percentile",
+                                        fontsize=10, fontweight="700",
+                                        color="#ef4444", va="center")
+
+                        ax_bp2.set_xticks([0])
+                        ax_bp2.set_xticklabels([trend_dept], fontsize=10)
+                        ax_bp2.set_ylabel("Avg Behaviour Score (0–4)", fontsize=10)
+                        ax_bp2.set_ylim(0, 4.2)
+                        ax_bp2.set_title("Overall Score — Physician vs Department", fontsize=11, fontweight="bold")
+                        ax_bp2.legend(fontsize=9, loc="lower right")
+                        ax_bp2.grid(axis="y", alpha=0.3, linestyle="--")
+                        ax_bp2.set_facecolor("#fafafa")
+                        fig_bp2.patch.set_facecolor("white")
+                        plt.tight_layout()
+                        st.pyplot(fig_bp2, use_container_width=True)
+                        plt.close()
+
+                    # ── Peer ranking table (compact) ───────────────────────────
+                    st.markdown("**Peer Ranking Table**")
+                    st.caption("Sorted by Overall Avg ↓ · Trend = last year minus first year")
+
                     peer_rows = []
                     for pid in all_phys_ids:
                         pid_data = raw_d[raw_d["physician_id"] == pid]
                         if pid_data.empty:
                             continue
-                        row = {"Physician ID": pid, "Years Active": 0}
+                        row = {"Physician ID": pid}
                         all_scores = []
                         for yr in years_avail:
                             yr_scores = pid_data[pid_data["year"] == yr]["overall_score"].dropna()
@@ -1159,363 +1431,741 @@ with tab5:
                             row[str(yr)] = avg
                             if not np.isnan(avg):
                                 all_scores.append(avg)
-                                row["Years Active"] += 1
                         row["Overall Avg"] = round(np.mean(all_scores), 3) if all_scores else np.nan
-                        # Trend direction: last year minus first year with data
                         valid = [row[str(yr)] for yr in years_avail if not np.isnan(row.get(str(yr), np.nan))]
-                        row["Trend"] = round(valid[-1] - valid[0], 3) if len(valid) >= 2 else np.nan
+                        trend_val = round(valid[-1] - valid[0], 3) if len(valid) >= 2 else np.nan
+                        row["Trend"] = f"▲ {trend_val:+.3f}" if pd.notna(trend_val) and trend_val > 0 else (
+                                       f"▼ {trend_val:+.3f}" if pd.notna(trend_val) and trend_val < 0 else "— 0.000")
                         peer_rows.append(row)
 
                     peer_df = pd.DataFrame(peer_rows).sort_values("Overall Avg", ascending=False).reset_index(drop=True)
-
-                    # Add rank and highlight selected physician
                     peer_df.insert(0, "Rank", range(1, len(peer_df)+1))
-                    peer_df["Selected"] = peer_df["Physician ID"] == selected_phys
-
-                    # ── Heatmap-style multi-year comparison chart ─────────────
-                    st.markdown("**Score Heatmap — All Physicians Across Years**")
-                    year_cols = [str(yr) for yr in years_avail if str(yr) in peer_df.columns]
-                    heatmap_data = peer_df.set_index("Physician ID")[year_cols].astype(float)
-
-                    fig_h, ax_h = plt.subplots(figsize=(max(6, len(year_cols)*2), max(5, len(peer_df)*0.38)))
-                    im = ax_h.imshow(heatmap_data.values, cmap="RdYlGn", aspect="auto",
-                                     vmin=0, vmax=4)
-
-                    # Axis labels
-                    ax_h.set_xticks(range(len(year_cols)))
-                    ax_h.set_xticklabels(year_cols, fontsize=11, fontweight="600")
-                    ax_h.set_yticks(range(len(heatmap_data)))
-                    ax_h.set_yticklabels(heatmap_data.index.tolist(), fontsize=9)
-
-                    # Annotate each cell with score value
-                    for i in range(len(heatmap_data)):
-                        for j in range(len(year_cols)):
-                            val = heatmap_data.values[i, j]
-                            if not np.isnan(val):
-                                ax_h.text(j, i, f"{val:.2f}", ha="center", va="center",
-                                          fontsize=8, fontweight="600",
-                                          color="white" if val < 1.5 or val > 3.2 else "#1f2937")
-
-                    # Highlight selected physician row with a border
-                    if selected_phys in heatmap_data.index:
-                        sel_row = heatmap_data.index.tolist().index(selected_phys)
-                        for j in range(len(year_cols)):
-                            ax_h.add_patch(plt.Rectangle(
-                                (j - 0.5, sel_row - 0.5), 1, 1,
-                                fill=False, edgecolor="#2563eb", linewidth=3, zorder=10
-                            ))
-                        ax_h.set_yticklabels(
-                            ["▶ " + pid if pid == selected_phys else pid
-                             for pid in heatmap_data.index.tolist()],
-                            fontsize=9
-                        )
-
-                    plt.colorbar(im, ax=ax_h, label="Avg Behaviour Score (0–4)", shrink=0.6)
-                    ax_h.set_title(f"{trend_dept} — Physician Score Heatmap (Selected: {selected_phys})",
-                                   fontsize=12, fontweight="bold", pad=12)
-                    fig_h.patch.set_facecolor("white")
-                    plt.tight_layout()
-                    st.pyplot(fig_h, use_container_width=True)
-                    plt.close()
-
-                    # ── Multi-line trend chart — all peers ────────────────────
-                    st.markdown("**Score Trajectory — Selected Physician vs All Peers**")
-                    fig_l, ax_l = plt.subplots(figsize=(9, 5))
-
-                    for _, prow in peer_df.iterrows():
-                        pid = prow["Physician ID"]
-                        yr_scores = [prow.get(str(yr), np.nan) for yr in years_avail]
-                        valid_yrs  = [yr for yr, sc in zip(years_avail, yr_scores) if not (isinstance(sc, float) and np.isnan(sc))]
-                        valid_scs  = [sc for sc in yr_scores if not (isinstance(sc, float) and np.isnan(sc))]
-                        if not valid_yrs:
-                            continue
-                        if pid == selected_phys:
-                            # Selected physician — bold blue on top
-                            ax_l.plot(valid_yrs, valid_scs, "o-",
-                                      color="#2563eb", linewidth=3, markersize=9,
-                                      zorder=10, label=f"▶ {pid} (selected)")
-                            for vyr, vsc in zip(valid_yrs, valid_scs):
-                                ax_l.annotate(f"{vsc:.2f}", (vyr, vsc),
-                                              textcoords="offset points", xytext=(0, 10),
-                                              ha="center", fontsize=9, fontweight="700",
-                                              color="#2563eb")
-                        else:
-                            # All other physicians — thin grey
-                            ax_l.plot(valid_yrs, valid_scs, "o-",
-                                      color="#d1d5db", linewidth=1, markersize=4,
-                                      alpha=0.6, zorder=1)
-
-                    # Department mean line
-                    dept_mean_line = [raw_d[raw_d["year"]==yr]["overall_score"].mean() for yr in years_avail]
-                    ax_l.plot(years_avail, dept_mean_line, "s--",
-                              color="#6b7280", linewidth=2, markersize=6,
-                              label="Dept Mean", zorder=5)
-
-                    ax_l.set_xticks(years_avail)
-                    ax_l.set_xlabel("Year", fontsize=10)
-                    ax_l.set_ylabel("Avg Behaviour Score (0–4)", fontsize=10)
-                    ax_l.set_title(f"{trend_dept} — All Physician Trajectories (Selected highlighted)",
-                                   fontsize=11, fontweight="bold")
-                    ax_l.legend(fontsize=9, loc="lower right")
-                    ax_l.grid(alpha=0.25, linestyle="--")
-                    ax_l.set_facecolor("#fafafa")
-                    fig_l.patch.set_facecolor("white")
-                    plt.tight_layout()
-                    st.pyplot(fig_l, use_container_width=True)
-                    plt.close()
-
-                    # ── Full peer comparison table ─────────────────────────────
-                    st.markdown("**Full Peer Comparison Table**")
-                    st.caption("Sorted by Overall Avg ↓ · Selected physician highlighted · Trend = last year minus first year")
-
-                    # Style: highlight selected physician row
-                    display_peer = peer_df.drop(columns=["Selected"]).copy()
-                    if "Trend" in display_peer.columns:
-                        display_peer["Trend"] = display_peer["Trend"].apply(
-                            lambda x: f"▲ {x:+.3f}" if (not isinstance(x, float) or not np.isnan(x)) and x > 0
-                            else (f"▼ {x:+.3f}" if (not isinstance(x, float) or not np.isnan(x)) and x < 0
-                            else ("— 0.000" if x == 0 else "—"))
-                        )
 
                     def highlight_selected(row):
                         if row["Physician ID"] == selected_phys:
                             return ["background-color: #dbeafe; font-weight: bold"] * len(row)
                         return [""] * len(row)
 
-                    styled = display_peer.style.apply(highlight_selected, axis=1).format(
-                        {str(yr): lambda x: f"{x:.3f}" if pd.notna(x) else "—" for yr in years_avail}
-                    ).format({"Overall Avg": lambda x: f"{x:.3f}" if pd.notna(x) else "—"})
-
+                    yr_fmt = {str(yr): lambda x: f"{x:.3f}" if pd.notna(x) else "—" for yr in years_avail}
+                    styled = peer_df.style.apply(highlight_selected, axis=1).format(
+                        {**yr_fmt, "Overall Avg": lambda x: f"{x:.3f}" if pd.notna(x) else "—"}
+                    )
                     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — ASK THE DATA (Claude-powered chatbot)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — DEPARTMENTS & DIVISIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEPT_DIVISION_MAP = {
+    "Anesthesia and Pain Medicine": [],
+    "Dentofacial Medicine":         ["Orthodontics"],
+    "Dermatology":                  [],
+    "Diagnostic Radiology":         [],
+    "Emergency Medicine":           [],
+    "Family Medicine":              [],
+    "Internal Medicine": [
+        "Cardiology",
+        "Endocrinology and Metabolism",
+        "Gastroenterology",
+        "General Internal Medicine and Geriatrics",
+        "Geriatrics",
+        "Hematology-Oncology",
+        "Infectious Diseases",
+        "Nephrology and Hypertension",
+        "Pulmonary and Critical Care",
+        "Rheumatology",
+    ],
+    "Neurology":        [],
+    "Ob/Gyn": [
+        "Obstetrics and Gynecology",
+        "Maternal-Fetal Medicine",
+        "Reproductive Endocrinology and Infertility",
+        "Gynecologic Oncology",
+    ],
+    "Ophthalmology": [
+        "Ophthalmology",
+        "Vitreo-Retinal surgery",
+        "Corneal/Refractive Surgery",
+        "Oculoplastics/Orbital/Lacrimal surgery",
+        "Pediatric Ophthalmology & Motility",
+    ],
+    "Otolaryngology, Head & Neck Surgery": [],
+    "Pathology and Lab":  [],
+    "Pediatrics": [
+        "Pediatrics and Adolescent Medicine",
+        "Neonatology",
+        "Pediatric Cardiology",
+        "Pediatric Critical Care",
+        "Pediatric Endocrinology",
+        "Pediatric Gastroenterology",
+        "Pediatric Hematology-Oncology",
+        "Pediatric Infectious Diseases",
+        "Pediatric Nephrology",
+        "Pediatric Neurology",
+        "Pediatric Pulmonology",
+    ],
+    "Psychiatry":        [],
+    "Radiation Oncology":[],
+    "Surgery": [
+        "General Surgery",
+        "Pediatric Surgery Service",
+        "Cardiothoracic Surgery",
+        "Neurosurgery",
+        "Orthopaedic Surgery",
+        "Plastic Surgery",
+        "Urology",
+        "Vascular Surgery",
+    ],
+}
+
+# Exact mapping: every Division value in the CSV -> parent Department label
+DIV_TO_DEPT = {
+    # Internal Medicine (13 rows in CSV)
+    "Cardiology":                               "Internal Medicine",
+    "Endocrinology":                            "Internal Medicine",
+    "Endocrinology and Metabolism":             "Internal Medicine",
+    "Gastroenterology":                         "Internal Medicine",
+    "General Internal Medicine and Geriatrics": "Internal Medicine",
+    "Geriatrics":                               "Internal Medicine",
+    "Hematology-Oncology":                      "Internal Medicine",
+    "Infectious Diseases":                      "Internal Medicine",
+    "Internal Medicine":                        "Internal Medicine",
+    "Nephrology":                               "Internal Medicine",
+    "Nephrology and Hypertension":              "Internal Medicine",
+    "Pulmonary and Critical Care":              "Internal Medicine",
+    "Rheumatology":                             "Internal Medicine",
+    # Surgery (8)
+    "General Surgery":                          "Surgery",
+    "Pediatric Surgery Service":                "Surgery",
+    "Cardiothoracic Surgery":                   "Surgery",
+    "Neurosurgery":                             "Surgery",
+    "Orthopaedic Surgery":                      "Surgery",
+    "Plastic Surgery":                          "Surgery",
+    "Urology":                                  "Surgery",
+    "Vascular Surgery":                         "Surgery",
+    # Ob/Gyn (4)
+    "Obstetrics and Gynecology":                "Ob/Gyn",
+    "Maternal-Fetal Medicine":                  "Ob/Gyn",
+    "Reproductive Endocrinology and Infertility": "Ob/Gyn",
+    "Gynecologic Oncology":                     "Ob/Gyn",
+    # Ophthalmology (5)
+    "Ophthalmology":                            "Ophthalmology",
+    "Vitreo-Retinal surgery":                   "Ophthalmology",
+    "Corneal/Refractive Surgery":               "Ophthalmology",
+    "Oculoplastics/Orbital/Lacrimal surgery":   "Ophthalmology",
+    "Pediatric Ophthalmology & Motility":       "Ophthalmology",
+    # Pediatrics (11)
+    "Pediatrics and Adolescent Medicine":       "Pediatrics",
+    "Neonatology":                              "Pediatrics",
+    "Pediatric Cardiology":                     "Pediatrics",
+    "Pediatric Critical Care":                  "Pediatrics",
+    "Pediatric Endocrinology":                  "Pediatrics",
+    "Pediatric Gastroenterology":               "Pediatrics",
+    "Pediatric Hematology-Oncology":            "Pediatrics",
+    "Pediatric Infectious Diseases":            "Pediatrics",
+    "Pediatric Nephrology":                     "Pediatrics",
+    "Pediatric Neurology":                      "Pediatrics",
+    "Pediatric Pulmonology":                    "Pediatrics",
+    # Standalone departments (each maps to itself)
+    "Anesthesia and Pain Medicine":             "Anesthesia and Pain Medicine",
+    "Dentofacial Medicine":                     "Dentofacial Medicine",
+    "Orthodontics":                             "Dentofacial Medicine",
+    "Dermatology":                              "Dermatology",
+    "Diagnostic Radiology":                     "Diagnostic Radiology",
+    "Emergency Medicine":                       "Emergency Medicine",
+    "Family Medicine":                          "Family Medicine",
+    "Neurology":                                "Neurology",
+    "Otorhinolaryngology - Head and Neck Surgery": "Otolaryngology, Head & Neck Surgery",
+    "Pathology and Lab":                        "Pathology and Lab",
+    "Psychiatry":                               "Psychiatry",
+    "Radiation Oncology":                       "Radiation Oncology",
+}
+
+
 with tab6:
-    st.markdown('<div class="section-header">🤖 Ask the Data — AI-Powered Analysis</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">🏢 Departments & Divisions — Indicators Analysis</div>', unsafe_allow_html=True)
+    st.markdown("Upload the **Physicians Indicators CSV** to explore performance by department and division.")
 
-    # ── Check prerequisites ───────────────────────────────────────────────────
-    if not ANTHROPIC_AVAILABLE:
-        st.error("anthropic package not installed. Run: pip install anthropic")
-        st.stop()
+    ind_file = st.file_uploader(
+        "📂 Upload Physicians_Indicators CSV", type="csv", key="ind_upload",
+        help="Expected columns: Aubnetid, FiscalCycle, Division, ClinicVisits, ClinicWaitingTime, PatientComplaints"
+    )
 
-    if not api_key_input:
-        st.info("👈 Enter your Anthropic API key in the sidebar to enable the chatbot.")
-        st.markdown("""
-        **How to get your API key:**
-        1. Go to [console.anthropic.com](https://console.anthropic.com)
-        2. Sign up or log in
-        3. Click **API Keys** in the left menu
-        4. Click **Create Key** — copy it (you only see it once)
-        5. Paste it into the sidebar field above
-        """)
-        st.stop()
+    if ind_file is None:
+        st.info("👆 Upload your indicators file to begin.")
+        st.markdown("---")
+        st.markdown('<div class="section-header">📋 AUBMC Organisational Structure</div>', unsafe_allow_html=True)
+        org_cols = st.columns(2)
+        dept_list = list(DEPT_DIVISION_MAP.keys())
+        half = len(dept_list) // 2
+        for col, depts in zip(org_cols, [dept_list[:half], dept_list[half:]]):
+            with col:
+                for dept in depts:
+                    divs = DEPT_DIVISION_MAP[dept]
+                    if divs:
+                        with st.expander(f"**{dept}** — {len(divs)} divisions"):
+                            for d in divs:
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;• {d}")
+                    else:
+                        st.markdown(f"**{dept}**")
+    else:
 
-    # ── Build data context for Claude ─────────────────────────────────────────
-    def build_data_context(all_phys, data, available_depts):
-        """
-        Serialise the key physician performance data into a compact JSON context
-        that will be injected into Claude's system prompt.
-        Keeps only the columns Claude needs — avoids hitting token limits.
-        """
-        context = {}
+        @st.cache_data
+        def load_indicators(file):
+            df = pd.read_csv(file)
+            df.columns = df.columns.str.strip()
+            # Department and Division columns come directly from the file
+            if "Division" in df.columns:
+                df["Division_norm"] = df["Division"].str.strip()
+            if "Department" in df.columns:
+                df["Department"] = df["Department"].str.strip()
+            for col in ["ClinicVisits", "ClinicWaitingTime", "PatientComplaints"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df
 
-        # Overall summary
-        context["summary"] = {
-            "total_physicians":  int(len(all_phys)),
-            "departments":       available_depts,
-            "priority_flags":    int((all_phys["risk_score"] == 2).sum()),
-            "monitor_flags":     int((all_phys["risk_score"] == 1).sum()),
-            "clear":             int((all_phys["risk_score"] == 0).sum()),
-            "overall_avg_score": round(float(all_phys["avg_behavior_score"].mean()), 3),
-        }
 
-        # Per-department stats
-        context["departments_detail"] = {}
-        for dept in available_depts:
-            _, phys_d, _ = data[dept]
-            if phys_d is None or phys_d.empty:
-                continue
-            context["departments_detail"][dept] = {
-                "physicians":       int(len(phys_d)),
-                "avg_score":        round(float(phys_d["avg_behavior_score"].mean()), 3),
-                "median_score":     round(float(phys_d["avg_behavior_score"].median()), 3),
-                "funnel_outliers":  int(phys_d["low_funnel_outlier"].sum()),
-                "sentiment_flags":  int(phys_d["negative_outlier"].sum()),
-                "priority_flags":   int((phys_d["risk_score"] == 2).sum()),
-                "monitor_flags":    int((phys_d["risk_score"] == 1).sum()),
-            }
+        ind_df = load_indicators(ind_file)
 
-        # Full physician table — key columns only
-        keep_cols = [
-            "physician_id", "department", "avg_behavior_score", "n_forms",
-            "z_score", "low_funnel_outlier", "low_iqr_outlier", "low_z_outlier",
-            "low_bottom10", "negative_ratio", "avg_compound",
-            "negative_outlier", "risk_score", "final_flag"
-        ]
-        avail_cols = [c for c in keep_cols if c in all_phys.columns]
-        phys_records = (
-            all_phys[avail_cols]
-            .sort_values("risk_score", ascending=False)
-            .round(3)
-            .fillna("N/A")
-            .to_dict(orient="records")
-        )
-        context["physicians"] = phys_records
+        # Show detected columns so user can verify mapping
+        with st.expander("🔍 Detected columns in your file", expanded=False):
+            st.write(list(ind_df.columns))
+            expected = ["Aubnetid","FiscalCycle","Division","ClinicVisits","ClinicWaitingTime","PatientComplaints"]
+            missing  = [c for c in expected if c not in ind_df.columns]
+            if missing:
+                st.warning(f"Missing expected columns: {missing} — some metrics will show 0")
+            else:
+                st.success("All expected columns found ✅")
 
-        return json.dumps(context, default=str)
-
-    # ── System prompt ─────────────────────────────────────────────────────────
-    def build_system_prompt(data_context):
-        return f"""You are an expert medical performance analyst assistant embedded in the AUBMC Physician Performance Dashboard.
-
-You have access to physician behaviour survey data covering 3 departments (AUBMC General, Emergency Department, Pathology & Lab) across 2023–2025.
-
-## YOUR CAPABILITIES
-- Answer specific questions about physician performance data (scores, flags, rankings)
-- Generate narrative summaries and reports for individual physicians or departments
-- Suggest which physicians warrant priority review and explain why
-- Explain the methodology (funnel plots, VADER sentiment, IQR, z-scores, risk scores)
-- Identify patterns and trends across departments or over time
-
-## METHODOLOGY REFERENCE
-- **Behaviour Score**: Mean of Likert survey responses (0=Never to 4=Always). Higher = better.
-- **Funnel Plot Flag** (low_funnel_outlier): Score below 95% lower control limit for their sample size. PRIMARY flag.
-- **IQR Flag** (low_iqr_outlier): Score below Q1 - 1.5×IQR. Secondary.
-- **Z-Score Flag** (low_z_outlier): More than 2 SD below department mean.
-- **Bottom 10%** (low_bottom10): In lowest 10th percentile of department.
-- **Sentiment Flag** (negative_outlier): Negative comment ratio above IQR upper fence (min 5 comments).
-- **Risk Score**: 0=clear, 1=monitor (one flag), 2=priority review (both funnel + sentiment flagged).
-- **VADER Compound**: −1.0 (very negative) to +1.0 (very positive). Threshold: ≤−0.05 = NEGATIVE.
-- All physician IDs are anonymised.
-
-## RESPONSE STYLE
-- Be concise and precise — use numbers from the data
-- When listing physicians, always include their ID, score, and risk level
-- For reports/summaries, use clear sections with headers
-- If asked to suggest review priorities, rank by risk_score=2 first, then by lowest avg_behavior_score
-- If data is ambiguous or incomplete, say so clearly
-- Never invent data — only use what is provided
-
-## LIVE DATA CONTEXT
-{data_context}
-"""
-
-    # ── Suggested questions ───────────────────────────────────────────────────
-    SUGGESTED_QUESTIONS = [
-        "Who are the priority review physicians across all departments?",
-        "Which department has the highest average behaviour score?",
-        "Write a summary report for the ED department",
-        "Which physicians have both a funnel plot flag and a sentiment flag?",
-        "Show me the bottom 5 physicians by average score",
-        "Which physicians improved their score over time?",
-        "Explain how the risk score is calculated",
-        "Are there any physicians I should urgently review?",
-    ]
-
-    # ── Initialise chat session state ─────────────────────────────────────────
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []
-    if "chat_context_built" not in st.session_state:
-        st.session_state.chat_context_built = False
-
-    # Build context once per session (or when data changes)
-    data_context = build_data_context(all_phys, data, available_depts)
-
-    # ── Layout ────────────────────────────────────────────────────────────────
-    col_chat, col_info = st.columns([2.2, 1])
-
-    with col_info:
-        st.markdown("**💡 Suggested Questions**")
-        for q in SUGGESTED_QUESTIONS:
-            if st.button(q, key=f"sq_{q[:30]}", use_container_width=True):
-                st.session_state.chat_messages.append({"role": "user", "content": q})
-                st.rerun()
+        # ── Cycle filter ──────────────────────────────────────────────────────
+        cycles = ["All"] + sorted(ind_df["FiscalCycle"].dropna().unique().tolist(), reverse=True) \
+                 if "FiscalCycle" in ind_df.columns else ["All"]
+        fc1, fc2 = st.columns([1, 3])
+        with fc1:
+            sel_cycle = st.selectbox("Fiscal Cycle", cycles, key="ind_cycle")
+        df_filt = ind_df if sel_cycle == "All" else ind_df[ind_df["FiscalCycle"] == sel_cycle]
+        n_dept = df_filt["Department"].nunique() if "Department" in df_filt.columns else "—"
+        n_div  = df_filt["Division_norm"].nunique() if "Division_norm" in df_filt.columns else "—"
+        with fc2:
+            st.markdown(
+                f"<div style='padding-top:28px; color:#6b7280; font-size:13px'>"
+                f"{len(df_filt):,} physicians &nbsp;·&nbsp; {n_dept} departments &nbsp;·&nbsp; {n_div} divisions"
+                f"</div>",
+                unsafe_allow_html=True
+            )
 
         st.markdown("---")
-        st.markdown("**📊 Data in Context**")
-        st.markdown(f"""
-        - **{len(all_phys)}** physicians loaded
-        - **{len(available_depts)}** departments
-        - **{int((all_phys['risk_score']==2).sum())}** priority flags
-        - **{int((all_phys['risk_score']==1).sum())}** monitor flags
-        """)
 
-        if st.button("🗑️ Clear Chat", use_container_width=True):
-            st.session_state.chat_messages = []
-            st.rerun()
+        # ── KPI cards ─────────────────────────────────────────────────────────
+        k1, k2, k3, k4 = st.columns(4)
+        total_physicians = len(df_filt)
+        total_visits     = int(df_filt["ClinicVisits"].sum())       if "ClinicVisits"      in df_filt.columns else 0
+        total_complaints = int(df_filt["PatientComplaints"].sum())  if "PatientComplaints" in df_filt.columns else 0
+        avg_wait         = df_filt["ClinicWaitingTime"].mean()      if "ClinicWaitingTime" in df_filt.columns else np.nan
 
-    with col_chat:
-        # Display chat history
-        chat_container = st.container()
-        with chat_container:
-            if not st.session_state.chat_messages:
-                st.markdown("""
-                <div style="text-align:center; padding:40px; color:#9ca3af;">
-                    <div style="font-size:48px">🤖</div>
-                    <div style="font-size:16px; margin-top:12px; font-weight:600">Ask me anything about your physician data</div>
-                    <div style="font-size:13px; margin-top:8px">Use the suggested questions on the right, or type your own below</div>
-                </div>
-                """, unsafe_allow_html=True)
+        with k1:
+            st.markdown(f'''<div class="metric-card neutral">
+                <div class="metric-label">Physicians</div>
+                <div class="metric-value">{total_physicians}</div>
+                <div class="metric-sub">{sel_cycle}</div>
+            </div>''', unsafe_allow_html=True)
+        with k2:
+            st.markdown(f'''<div class="metric-card success">
+                <div class="metric-label">Total Clinic Visits</div>
+                <div class="metric-value">{total_visits:,}</div>
+                <div class="metric-sub">all departments</div>
+            </div>''', unsafe_allow_html=True)
+        with k3:
+            wt_class = "success" if pd.isna(avg_wait) or avg_wait < 20 else ("warning" if avg_wait < 40 else "danger")
+            wt_val   = f"{avg_wait:.1f} min" if pd.notna(avg_wait) else "—"
+            st.markdown(f'''<div class="metric-card {wt_class}">
+                <div class="metric-label">Avg Waiting Time</div>
+                <div class="metric-value">{wt_val}</div>
+                <div class="metric-sub">clinic waiting time</div>
+            </div>''', unsafe_allow_html=True)
+        with k4:
+            cmp_class = "success" if total_complaints == 0 else ("warning" if total_complaints < 20 else "danger")
+            st.markdown(f'''<div class="metric-card {cmp_class}">
+                <div class="metric-label">Patient Complaints</div>
+                <div class="metric-value">{total_complaints:,}</div>
+                <div class="metric-sub">total reported</div>
+            </div>''', unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Department overview ───────────────────────────────────────────────
+        st.markdown('<div class="section-header">📊 Department Overview</div>', unsafe_allow_html=True)
+
+        if "Department" in df_filt.columns:
+            # Build agg spec only from columns that actually exist in the file
+            agg_spec = {}
+            id_col = "Aubnetid" if "Aubnetid" in df_filt.columns else (df_filt.columns[0])
+            agg_spec["Physicians"] = (id_col, "nunique")
+            if "Division_norm"    in df_filt.columns: agg_spec["Divisions"]        = ("Division_norm",    "nunique")
+            if "ClinicVisits"     in df_filt.columns: agg_spec["Total_Visits"]     = ("ClinicVisits",     "sum")
+            if "ClinicWaitingTime"in df_filt.columns: agg_spec["Avg_Wait"]         = ("ClinicWaitingTime","mean")
+            if "PatientComplaints"in df_filt.columns: agg_spec["Total_Complaints"] = ("PatientComplaints","sum")
+            if "PatientComplaints"in df_filt.columns: agg_spec["Avg_Complaints"]   = ("PatientComplaints","mean")
+
+            dept_summary = (
+                df_filt.groupby("Department", as_index=False)
+                .agg(**agg_spec)
+                .reset_index(drop=True)
+            )
+            # Add missing columns as zeros so downstream code doesn't break
+            for c in ["Total_Visits", "Total_Complaints", "Divisions", "Avg_Wait", "Avg_Complaints"]:
+                if c not in dept_summary.columns:
+                    dept_summary[c] = 0
+            for c in ["Total_Visits", "Total_Complaints"]:
+                dept_summary[c] = dept_summary[c].fillna(0).astype(int)
+            dept_summary["Avg_Wait"]       = dept_summary["Avg_Wait"].round(1)
+            dept_summary["Avg_Complaints"] = dept_summary["Avg_Complaints"].round(2)
+            dept_summary = dept_summary.sort_values("Total_Visits", ascending=False).reset_index(drop=True)
+
+            dv1, dv2 = st.columns(2)
+            with dv1:
+                st.markdown("**Clinic Visits by Department**")
+                fig, ax = plt.subplots(figsize=(7, max(4, len(dept_summary) * 0.42)))
+                colours = ["#ef4444" if v == dept_summary["Total_Visits"].max()
+                           else "#3b82f6" for v in dept_summary["Total_Visits"]]
+                bars = ax.barh(dept_summary["Department"], dept_summary["Total_Visits"],
+                               color=colours, edgecolor="white", linewidth=0.8, alpha=0.85)
+                mx = dept_summary["Total_Visits"].max()
+                for bar, val in zip(bars, dept_summary["Total_Visits"]):
+                    ax.text(val + mx * 0.01, bar.get_y() + bar.get_height() / 2,
+                            f"{val:,}", va="center", fontsize=8, fontweight="600")
+                ax.set_xlabel("Total Clinic Visits", fontsize=10)
+                ax.set_title("Clinic Visits by Department", fontsize=11, fontweight="bold")
+                ax.grid(axis="x", alpha=0.3, linestyle="--")
+                ax.set_facecolor("#fafafa")
+                fig.patch.set_facecolor("white")
+                plt.tight_layout()
+                st.pyplot(fig, use_container_width=True)
+                plt.close()
+
+            with dv2:
+                st.markdown("**Patient Complaints by Department**")
+                dept_cmp = dept_summary[dept_summary["Total_Complaints"] > 0].sort_values("Total_Complaints", ascending=False)
+                if dept_cmp.empty:
+                    st.success("No complaints recorded for this cycle.")
+                else:
+                    fig2, ax2 = plt.subplots(figsize=(7, max(4, len(dept_cmp) * 0.42)))
+                    c2 = ["#ef4444" if v == dept_cmp["Total_Complaints"].max()
+                          else "#f59e0b" for v in dept_cmp["Total_Complaints"]]
+                    bars2 = ax2.barh(dept_cmp["Department"], dept_cmp["Total_Complaints"],
+                                     color=c2, edgecolor="white", linewidth=0.8, alpha=0.85)
+                    for bar, val in zip(bars2, dept_cmp["Total_Complaints"]):
+                        ax2.text(val + 0.1, bar.get_y() + bar.get_height() / 2,
+                                 str(int(val)), va="center", fontsize=8, fontweight="600")
+                    ax2.set_xlabel("Total Patient Complaints", fontsize=10)
+                    ax2.set_title("Patient Complaints by Department", fontsize=11, fontweight="bold")
+                    ax2.grid(axis="x", alpha=0.3, linestyle="--")
+                    ax2.set_facecolor("#fafafa")
+                    fig2.patch.set_facecolor("white")
+                    plt.tight_layout()
+                    st.pyplot(fig2, use_container_width=True)
+                    plt.close()
+
+            st.markdown("**Department Summary Table**")
+            dept_display = dept_summary.copy()
+            dept_display.columns = ["Department", "Physicians", "Divisions", "Total Visits",
+                                     "Avg Wait (min)", "Total Complaints", "Avg Complaints/Physician"]
+            st.dataframe(dept_display, use_container_width=True, hide_index=True,
+                         column_config={
+                             "Total Visits": st.column_config.ProgressColumn(
+                                 min_value=0, max_value=int(dept_display["Total Visits"].max()), format="%d"),
+                             "Total Complaints": st.column_config.ProgressColumn(
+                                 min_value=0, max_value=max(1, int(dept_display["Total Complaints"].max())), format="%d"),
+                         })
+
+        st.markdown("---")
+
+        # ── Division drill-down ───────────────────────────────────────────────
+        st.markdown('<div class="section-header">🔬 Division Drill-Down</div>', unsafe_allow_html=True)
+
+        dd1, dd2 = st.columns([1, 2])
+        with dd1:
+            dept_opts = ["All Departments"] + sorted(df_filt["Department"].dropna().unique().tolist()) \
+                        if "Department" in df_filt.columns else ["All Departments"]
+            sel_dept = st.selectbox("Filter by Department", dept_opts, key="div_dept")
+
+        df_div = df_filt if sel_dept == "All Departments" else df_filt[df_filt["Department"] == sel_dept]
+
+        if "Division_norm" in df_div.columns:
+            div_agg = {}
+            id_col2 = "Aubnetid" if "Aubnetid" in df_div.columns else df_div.columns[0]
+            div_agg["Physicians"] = (id_col2, "nunique")
+            if "ClinicVisits"     in df_div.columns: div_agg["Total_Visits"]     = ("ClinicVisits",     "sum")
+            if "ClinicWaitingTime"in df_div.columns: div_agg["Avg_Wait"]         = ("ClinicWaitingTime","mean")
+            if "PatientComplaints"in df_div.columns: div_agg["Total_Complaints"] = ("PatientComplaints","sum")
+
+            div_summary = (
+                df_div.groupby("Division_norm", as_index=False)
+                .agg(**div_agg)
+                .sort_values("Total_Visits" if "Total_Visits" in div_agg else "Physicians", ascending=False)
+                .reset_index(drop=True)
+            )
+            for c in ["Total_Visits", "Total_Complaints", "Avg_Wait"]:
+                if c not in div_summary.columns:
+                    div_summary[c] = 0
+            for c in ["Total_Visits", "Total_Complaints"]:
+                div_summary[c] = div_summary[c].fillna(0).astype(int)
+            div_summary["Avg_Wait"] = div_summary["Avg_Wait"].round(1)
+
+            with dd2:
+                st.markdown(f"**{len(div_summary)} divisions** shown")
+
+            fig3, ax3 = plt.subplots(figsize=(9, max(5, len(div_summary) * 0.38)))
+            div_colours = ["#3b82f6" if c == 0 else "#f59e0b" if c < 3 else "#ef4444"
+                           for c in div_summary["Total_Complaints"]]
+            bars3 = ax3.barh(div_summary["Division_norm"], div_summary["Total_Visits"],
+                             color=div_colours, edgecolor="white", linewidth=0.8, alpha=0.85)
+            mx3 = div_summary["Total_Visits"].max()
+            for bar, val, cmp in zip(bars3, div_summary["Total_Visits"], div_summary["Total_Complaints"]):
+                label = f"{val:,}" + (f"  ⚠ {int(cmp)}" if cmp > 0 else "")
+                col_txt = "#ef4444" if cmp > 0 else "#374151"
+                ax3.text(val + mx3 * 0.005, bar.get_y() + bar.get_height() / 2,
+                         label, va="center", fontsize=8, color=col_txt, fontweight="600")
+            ax3.set_xlabel("Clinic Visits (⚠ = has complaints)", fontsize=10)
+            ax3.set_title(f"Division Performance — {sel_dept}", fontsize=11, fontweight="bold")
+            ax3.grid(axis="x", alpha=0.3, linestyle="--")
+            ax3.set_facecolor("#fafafa")
+            fig3.patch.set_facecolor("white")
+            ax3.legend(handles=[
+                mpatches.Patch(color="#3b82f6", alpha=0.85, label="No complaints"),
+                mpatches.Patch(color="#f59e0b", alpha=0.85, label="1–2 complaints"),
+                mpatches.Patch(color="#ef4444", alpha=0.85, label="3+ complaints"),
+            ], fontsize=8, loc="lower right")
+            plt.tight_layout()
+            st.pyplot(fig3, use_container_width=True)
+            plt.close()
+
+            st.markdown("**Division Detail Table**")
+            div_display = div_summary.copy()
+            div_display.columns = ["Division", "Physicians", "Total Visits", "Avg Wait (min)", "Total Complaints"]
+            st.dataframe(div_display, use_container_width=True, hide_index=True,
+                         column_config={
+                             "Total Visits": st.column_config.ProgressColumn(
+                                 min_value=0, max_value=int(div_display["Total Visits"].max()), format="%d"),
+                             "Total Complaints": st.column_config.ProgressColumn(
+                                 min_value=0, max_value=max(1, int(div_display["Total Complaints"].max())), format="%d"),
+                         })
+
+        st.markdown("---")
+
+        # ── Physician-level explorer ──────────────────────────────────────────
+        st.markdown('<div class="section-header">👤 Physician-Level Explorer</div>', unsafe_allow_html=True)
+
+        pe1, pe2, pe3 = st.columns(3)
+        with pe1:
+            dept_opts2 = ["All"] + sorted(df_filt["Department"].dropna().unique().tolist()) \
+                         if "Department" in df_filt.columns else ["All"]
+            sel_dept2 = st.selectbox("Department", dept_opts2, key="pe_dept")
+        df_pe = df_filt if sel_dept2 == "All" else df_filt[df_filt["Department"] == sel_dept2]
+        with pe2:
+            div_opts = ["All"] + sorted(df_pe["Division_norm"].dropna().unique().tolist()) \
+                       if "Division_norm" in df_pe.columns else ["All"]
+            sel_div = st.selectbox("Division", div_opts, key="pe_div")
+        df_pe = df_pe if sel_div == "All" else df_pe[df_pe["Division_norm"] == sel_div]
+        with pe3:
+            sort_opts = ["Clinic Visits ↓", "Patient Complaints ↓", "Waiting Time ↓"]
+            sel_sort  = st.selectbox("Sort by", sort_opts, key="pe_sort")
+
+        sort_col_map = {
+            "Clinic Visits ↓":      "ClinicVisits",
+            "Patient Complaints ↓": "PatientComplaints",
+            "Waiting Time ↓":       "ClinicWaitingTime",
+        }
+        sort_col = sort_col_map[sel_sort]
+        if sort_col in df_pe.columns:
+            df_pe = df_pe.sort_values(sort_col, ascending=False)
+
+        show_cols  = ["Aubnetid", "Division_norm", "Department", "FiscalCycle",
+                      "ClinicVisits", "ClinicWaitingTime", "PatientComplaints"]
+        avail_show = [c for c in show_cols if c in df_pe.columns]
+        show_renamed = df_pe[avail_show].rename(columns={
+            "Aubnetid":          "Physician ID",
+            "Division_norm":     "Division",
+            "FiscalCycle":       "Cycle",
+            "ClinicVisits":      "Clinic Visits",
+            "ClinicWaitingTime": "Wait Time (min)",
+            "PatientComplaints": "Complaints",
+        }).reset_index(drop=True)
+
+        max_visits = int(df_filt["ClinicVisits"].max())     if "ClinicVisits"      in df_filt.columns else 100
+        max_cmp    = int(df_filt["PatientComplaints"].max())if "PatientComplaints" in df_filt.columns else 10
+        st.dataframe(show_renamed, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Clinic Visits": st.column_config.ProgressColumn(
+                             min_value=0, max_value=max_visits, format="%d"),
+                         "Complaints":    st.column_config.ProgressColumn(
+                             min_value=0, max_value=max(1, max_cmp), format="%d"),
+                     })
+
+        csv_ind = show_renamed.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Export filtered table as CSV", csv_ind,
+                           "division_physicians.csv", "text/csv")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # COMPLAINTS × SENTIMENT CROSS-ANALYSIS
+        # ══════════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown('<div class="section-header">🔗 Complaints × Sentiment — Combined Outlier Analysis</div>', unsafe_allow_html=True)
+        st.markdown(
+            "Physicians flagged here have **≥1 patient complaint** "
+            "**and/or** negative peer sentiment from survey comments. "
+            "Priority = both signals active · Monitor = one signal · Clear = neither."
+        )
+
+        # ── Check if survey sentiment data is available ───────────────────────
+        sent_frames = []
+        for dept_name in available_depts:
+            _, _, sent_raw = data[dept_name]
+            if sent_raw is not None and not sent_raw.empty:
+                sent_raw_copy = sent_raw.copy()
+                sent_raw_copy["dept_source"] = dept_name
+                sent_frames.append(sent_raw_copy)
+
+        if not sent_frames:
+            st.warning("No survey comment data loaded yet. Upload your behaviour survey CSVs in the sidebar to enable this analysis.")
+        else:
+            # Combine all sentiment data
+            all_sent = pd.concat(sent_frames, ignore_index=True)
+
+            # Build per-physician sentiment summary across all departments
+            sent_cross = (
+                all_sent.assign(is_neg=(all_sent["sentiment"] == "NEGATIVE"))
+                .groupby("physician_id", as_index=False)
+                .agg(
+                    total_comments   =("is_neg",   "count"),
+                    negative_comments=("is_neg",   "sum"),
+                    avg_compound     =("compound", "mean"),
+                )
+            )
+            sent_cross["negative_ratio"] = sent_cross["negative_comments"] / sent_cross["total_comments"]
+
+            # Sentiment flag: IQR upper fence on negative_ratio (min 3 comments)
+            Q1s, Q3s = sent_cross["negative_ratio"].quantile(0.25), sent_cross["negative_ratio"].quantile(0.75)
+            sent_ub  = Q3s + 1.5 * (Q3s - Q1s)
+            sent_cross["sentiment_flag"] = (
+                (sent_cross["negative_ratio"] > sent_ub) &
+                (sent_cross["total_comments"] >= 3)
+            )
+
+            # ── Complaints: IQR upper fence per physician ─────────────────────
+            if "PatientComplaints" not in df_filt.columns or "Aubnetid" not in df_filt.columns:
+                st.warning("PatientComplaints or Aubnetid column not found in indicators file.")
             else:
-                for msg in st.session_state.chat_messages:
-                    if msg["role"] == "user":
-                        st.markdown(f"""
-                        <div style="display:flex; justify-content:flex-end; margin-bottom:12px;">
-                            <div style="background:#2563eb; color:white; border-radius:18px 18px 4px 18px;
-                                        padding:12px 16px; max-width:80%; font-size:14px; line-height:1.5">
-                                {msg["content"]}
-                            </div>
-                        </div>""", unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"""
-                        <div style="display:flex; justify-content:flex-start; margin-bottom:12px;">
-                            <div style="background:white; border:1px solid #e5e7eb; border-radius:18px 18px 18px 4px;
-                                        padding:12px 16px; max-width:85%; font-size:14px; line-height:1.6;
-                                        box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-                                {msg["content"].replace(chr(10), "<br>")}
-                            </div>
-                        </div>""", unsafe_allow_html=True)
+                # Use 2025 data only for complaints × sentiment analysis
+                if "FiscalCycle" in df_filt.columns:
+                    cycles_avail = df_filt["FiscalCycle"].dropna().unique().tolist()
+                    cycle_2025   = [c for c in cycles_avail if "2025" in str(c)]
+                    df_complaints_src = df_filt[df_filt["FiscalCycle"].isin(cycle_2025)] if cycle_2025 else df_filt
+                    cycle_label = "2025" if cycle_2025 else "all cycles (2025 not found)"
+                else:
+                    df_complaints_src = df_filt
+                    cycle_label = "all cycles"
+                st.caption(f"📅 Complaints data: **{cycle_label}** · {len(df_complaints_src):,} records")
 
-        # ── Chat input & API call ─────────────────────────────────────────────
-        user_input = st.chat_input("Ask about your data... e.g. 'Who needs urgent review?'")
+                complaints = (
+                    df_complaints_src.groupby("Aubnetid", as_index=False)
+                    .agg(
+                        total_complaints =("PatientComplaints", "sum"),
+                        department       =("Department",        lambda x: x.mode()[0] if not x.empty else "—"),
+                        division         =("Division",          lambda x: x.mode()[0] if not x.empty else "—"),
+                    )
+                )
+                complaints["total_complaints"] = pd.to_numeric(complaints["total_complaints"], errors="coerce").fillna(0)
 
-        if user_input:
-            st.session_state.chat_messages.append({"role": "user", "content": user_input})
-            st.rerun()
+                # Flag: any physician with >= 1 complaint (zero-tolerance rule)
+                complaints_ub = 0  # kept for scatter plot reference line
+                complaints["complaints_flag"] = complaints["total_complaints"] >= 1
 
-        # Process last user message if no assistant reply yet
-        if (st.session_state.chat_messages and
-                st.session_state.chat_messages[-1]["role"] == "user"):
+                # ── Merge complaints + sentiment on physician ID ───────────────
+                # Indicators uses Aubnetid; sentiment uses physician_id — same field
+                merged = complaints.merge(
+                    sent_cross.rename(columns={"physician_id": "Aubnetid"}),
+                    on="Aubnetid", how="left"
+                )
+                merged["sentiment_flag"]  = merged["sentiment_flag"].fillna(False)
+                merged["negative_ratio"]  = merged["negative_ratio"].fillna(0)
+                merged["avg_compound"]    = merged["avg_compound"].fillna(0)
+                merged["total_comments"]  = merged["total_comments"].fillna(0).astype(int)
 
-            with st.spinner("Analysing data..."):
-                try:
-                    client = anthropic.Anthropic(api_key=api_key_input)
+                # ── Combined outlier badge ────────────────────────────────────
+                def combined_badge(row):
+                    if row["complaints_flag"] and row["sentiment_flag"]:
+                        return "Priority"
+                    elif row["complaints_flag"] or row["sentiment_flag"]:
+                        return "Monitor"
+                    return "Clear"
 
-                    # Build message history for Claude (exclude system prompt from history)
-                    api_messages = [
-                        {"role": m["role"], "content": m["content"]}
-                        for m in st.session_state.chat_messages
-                    ]
+                merged["combined_status"] = merged.apply(combined_badge, axis=1)
 
-                    response = client.messages.create(
-                        model="claude-opus-4-6",
-                        max_tokens=1500,
-                        system=build_system_prompt(data_context),
-                        messages=api_messages
+                # ── Summary KPIs ──────────────────────────────────────────────
+                n_priority = (merged["combined_status"] == "Priority").sum()
+                n_monitor  = (merged["combined_status"] == "Monitor").sum()
+                n_clear    = (merged["combined_status"] == "Clear").sum()
+                n_total    = len(merged)
+
+                cx1, cx2, cx3, cx4 = st.columns(4)
+                with cx1:
+                    st.markdown(f'''<div class="metric-card danger">
+                        <div class="metric-label">⚠ Priority (Both Flags)</div>
+                        <div class="metric-value">{n_priority}</div>
+                        <div class="metric-sub">{n_priority/n_total*100:.1f}% of physicians</div>
+                    </div>''', unsafe_allow_html=True)
+                with cx2:
+                    st.markdown(f'''<div class="metric-card warning">
+                        <div class="metric-label">👁 Monitor (One Flag)</div>
+                        <div class="metric-value">{n_monitor}</div>
+                        <div class="metric-sub">{n_monitor/n_total*100:.1f}% of physicians</div>
+                    </div>''', unsafe_allow_html=True)
+                with cx3:
+                    st.markdown(f'''<div class="metric-card success">
+                        <div class="metric-label">✓ Clear</div>
+                        <div class="metric-value">{n_clear}</div>
+                        <div class="metric-sub">{n_clear/n_total*100:.1f}% of physicians</div>
+                    </div>''', unsafe_allow_html=True)
+                with cx4:
+                    has_any = int((complaints["total_complaints"] >= 1).sum())
+                    st.markdown(f'''<div class="metric-card neutral">
+                        <div class="metric-label">With ≥1 Complaint</div>
+                        <div class="metric-value">{has_any}</div>
+                        <div class="metric-sub">flagged physicians</div>
+                    </div>''', unsafe_allow_html=True)
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                # ── Side-by-side scatter: complaints vs sentiment ─────────────
+                st.markdown("**Complaints vs Sentiment Score — All Physicians**")
+                st.caption("Top-left = high complaints + negative sentiment = Priority · Dashed lines = IQR thresholds")
+
+                fig_s, ax_s = plt.subplots(figsize=(10, 6))
+
+                colour_map = {"Priority": "#ef4444", "Monitor": "#f59e0b", "Clear": "#10b981"}
+                for status, grp in merged.groupby("combined_status"):
+                    ax_s.scatter(
+                        grp["total_complaints"],
+                        grp["avg_compound"],
+                        c=colour_map.get(status, "#6b7280"),
+                        s=70, alpha=0.75, zorder=3,
+                        label=f"{status} (n={len(grp)})"
                     )
 
-                    assistant_reply = response.content[0].text
-                    st.session_state.chat_messages.append({
-                        "role": "assistant",
-                        "content": assistant_reply
-                    })
-                    st.rerun()
+                # Threshold lines
+                ax_s.axvline(complaints_ub, color="#ef4444", linestyle="--",
+                             linewidth=1.5, alpha=0.7, label=f"Complaint IQR fence ({complaints_ub:.0f})")
+                ax_s.axhline(-0.05, color="#f59e0b", linestyle=":",
+                             linewidth=1.5, alpha=0.7, label="Sentiment neutral threshold")
 
-                except anthropic.AuthenticationError:
-                    st.error("❌ Invalid API key. Check your key at console.anthropic.com")
-                except anthropic.RateLimitError:
-                    st.error("⚠️ Rate limit hit. Wait a moment and try again.")
-                except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
+                # Quadrant labels
+                y_range = merged["avg_compound"].max() - merged["avg_compound"].min()
+                y_top   = merged["avg_compound"].max() - y_range * 0.05
+                y_bot   = merged["avg_compound"].min() + y_range * 0.05
+                x_right = merged["total_complaints"].max() * 0.98
+
+                ax_s.text(complaints_ub + 0.3, y_bot,
+                          "⚠ HIGH RISK\nComplaints + Negative",
+                          fontsize=8, color="#ef4444", fontweight="700",
+                          va="bottom", ha="left",
+                          bbox=dict(boxstyle="round,pad=0.3", facecolor="#fef2f2", alpha=0.8))
+
+                ax_s.set_xlabel("Total Patient Complaints", fontsize=11)
+                ax_s.set_ylabel("Avg Sentiment Score (−1=negative, +1=positive)", fontsize=11)
+                ax_s.set_title("Patient Complaints vs Peer Sentiment — Combined Outlier View",
+                               fontsize=12, fontweight="bold")
+                ax_s.legend(fontsize=9, loc="upper right")
+                ax_s.grid(alpha=0.25, linestyle="--")
+                ax_s.set_facecolor("#fafafa")
+                fig_s.patch.set_facecolor("white")
+                plt.tight_layout()
+                st.pyplot(fig_s, use_container_width=True)
+                plt.close()
+
+                # ── Department peer comparison bar chart ──────────────────────
+                st.markdown("**Priority Physicians vs Department Peers**")
+
+                dept_cross = (
+                    merged.groupby("department", as_index=False)
+                    .agg(
+                        Total        =("Aubnetid",         "count"),
+                        Priority     =("combined_status",  lambda x: (x == "Priority").sum()),
+                        Monitor      =("combined_status",  lambda x: (x == "Monitor").sum()),
+                        Avg_Complaints=("total_complaints","mean"),
+                        Avg_Compound  =("avg_compound",    "mean"),
+                    )
+                )
+                dept_cross["Priority_pct"] = (dept_cross["Priority"] / dept_cross["Total"] * 100).round(1)
+                dept_cross = dept_cross.sort_values("Priority_pct", ascending=False)
+
+                fig_d, ax_d = plt.subplots(figsize=(10, max(4, len(dept_cross)*0.45)))
+                bar_c = ["#ef4444" if p > 0 else "#10b981" for p in dept_cross["Priority_pct"]]
+                bars_d = ax_d.barh(dept_cross["department"], dept_cross["Priority_pct"],
+                                   color=bar_c, edgecolor="white", linewidth=0.8, alpha=0.85)
+                for bar, pct, n in zip(bars_d, dept_cross["Priority_pct"], dept_cross["Priority"]):
+                    label = f"{pct:.1f}%  ({int(n)} physicians)" if n > 0 else "0%"
+                    ax_d.text(max(pct + 0.2, 0.5), bar.get_y() + bar.get_height()/2,
+                              label, va="center", fontsize=9, fontweight="600",
+                              color="#ef4444" if n > 0 else "#6b7280")
+                ax_d.set_xlabel("% Physicians with Priority Flag (High Complaints + Negative Sentiment)", fontsize=10)
+                ax_d.set_title("Priority Flag Rate by Department", fontsize=11, fontweight="bold")
+                ax_d.grid(axis="x", alpha=0.3, linestyle="--")
+                ax_d.set_facecolor("#fafafa")
+                fig_d.patch.set_facecolor("white")
+                plt.tight_layout()
+                st.pyplot(fig_d, use_container_width=True)
+                plt.close()
+
+                # ── Physician table (Priority first) ──────────────────────────
+                st.markdown("**Physician Combined Outlier Table**")
+                st.caption("Sorted by status → complaints → sentiment score")
+
+                status_order = {"Priority": 0, "Monitor": 1, "Clear": 2}
+                merged["_sort"] = merged["combined_status"].map(status_order)
+                table_out = (
+                    merged.sort_values(["_sort", "total_complaints", "avg_compound"],
+                                       ascending=[True, False, True])
+                    .drop(columns=["_sort"])
+                    [["Aubnetid", "department", "division",
+                      "total_complaints", "complaints_flag",
+                      "total_comments", "negative_ratio", "avg_compound",
+                      "sentiment_flag", "combined_status"]]
+                    .rename(columns={
+                        "Aubnetid":          "Physician ID",
+                        "department":        "Department",
+                        "division":          "Division",
+                        "total_complaints":  "Complaints",
+                        "complaints_flag":   "Complaint Flag",
+                        "total_comments":    "Comments Scored",
+                        "negative_ratio":    "Neg. Ratio",
+                        "avg_compound":      "Sentiment Score",
+                        "sentiment_flag":    "Sentiment Flag",
+                        "combined_status":   "Status",
+                    })
+                    .reset_index(drop=True)
+                )
+                table_out["Neg. Ratio"] = table_out["Neg. Ratio"].apply(lambda x: f"{x:.1%}")
+                table_out["Sentiment Score"] = table_out["Sentiment Score"].apply(lambda x: f"{x:.3f}")
+
+                max_cmp2 = int(table_out["Complaints"].max()) if len(table_out) > 0 else 10
+                st.dataframe(
+                    table_out,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Complaints": st.column_config.ProgressColumn(
+                            min_value=0, max_value=max_cmp2, format="%d"),
+                        "Status": st.column_config.SelectboxColumn(
+                            options=["Priority", "Monitor", "Clear"]),
+                    }
+                )
+
+                # Export
+                csv_cross = table_out.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Export combined outlier table", csv_cross,
+                                   "complaints_sentiment_outliers.csv", "text/csv")
