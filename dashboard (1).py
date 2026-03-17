@@ -172,10 +172,47 @@ def score_vader(text, threshold=-0.05):
         return {"compound": 0.0, "sentiment": "NEUTRAL"}
 
 def run_sentiment(df, threshold=-0.05):
+    import re as _re
+
+    # Normalise text: strip whitespace, remove non-printable chars, lowercase
+    def _normalise(text):
+        t = str(text).strip()
+        t = _re.sub(r"[^ -~؀-ۿ]", " ", t)  # keep ASCII + Arabic
+        t = _re.sub(r"\s+", " ", t).strip()
+        return t.lower()
+
+    SKIP_EXACT = {
+        "d/a", "n/a", "na", "n.a", "n.a.", "-", "--", "---", "none", "nil", ".",
+        "no comment", "no comments", "no interaction", "no interactions",
+        "i have never had the chance to work with", "never had the chance to work with",
+        "i have not had the chance to work with", "not had the chance to work with",
+        "i have never worked with", "never worked with",
+        "i have not worked with", "no opportunity to work with",
+        "no opportunity", "not applicable", "not available",
+    }
+    SKIP_PREFIXES = (
+        "no comment", "no comments", "no interaction", "no opportunity",
+        "d/a", "n/a",
+        "i have never had the chance", "i have not had the chance",
+        "never had the chance", "i never had the chance",
+        "haven't had the chance", "have not had the chance",
+        "i have never worked", "i have not worked", "never worked with",
+    )
+
+    def _is_skip(raw):
+        t = _normalise(raw)
+        t_clean = t.rstrip(".,;:!?/ ")
+        # exact match
+        if t_clean in SKIP_EXACT or t in SKIP_EXACT:
+            return True
+        # prefix match
+        return any(t_clean.startswith(p) or t.startswith(p) for p in SKIP_PREFIXES)
+
     df_s = df[
         (df.get("raters_group", pd.Series(dtype=str)) != "Faculty Self-Evaluation") &
         (df["comments"].notna()) &
-        (df["comments"].astype(str).str.strip() != "")
+        (df["comments"].astype(str).str.strip() != "") &
+        (~df["comments"].astype(str).apply(_is_skip))
     ].copy()
     df_s["comments"] = df_s["comments"].astype(str).str.strip()
     results = df_s["comments"].apply(lambda t: score_vader(t, threshold))
