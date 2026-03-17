@@ -16,7 +16,7 @@ st.set_page_config(
     page_title="AUBMC Physician Performance Dashboard",
     page_icon="🏥",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # ─── CUSTOM CSS ──────────────────────────────────────────────────────────────
@@ -62,6 +62,9 @@ st.markdown("""
     .comment-card.neg { border-left-color: #ef4444; }
     .comment-card.pos { border-left-color: #10b981; }
     .comment-card.neu { border-left-color: #d1d5db; }
+    /* Hide sidebar and its toggle button entirely */
+    [data-testid="collapsedControl"] { display: none !important; }
+    section[data-testid="stSidebar"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -245,51 +248,52 @@ def process_dept(df_raw, dept_name, threshold=-0.05, min_f=3):
     phys["department"] = dept_name
     return df, phys, sent_raw
 
-# ─── SIDEBAR ─────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🏥 AUBMC Dashboard")
-    st.markdown("**Physician Behaviour Performance**")
-    st.markdown("---")
-    st.markdown("### 📁 Upload Data Files")
-    st.markdown("Upload CSV exports from BLUE Explorance for each department and year.")
+# ─── FIXED SETTINGS ──────────────────────────────────────────────────────────
+min_forms   = 1
+sent_thresh = -0.01
 
-    with st.expander("AUBMC General", expanded=True):
-        f_aubmc_23 = st.file_uploader("AUBMC 2023", type="csv", key="a23")
-        f_aubmc_24 = st.file_uploader("AUBMC 2024", type="csv", key="a24")
-        f_aubmc_25 = st.file_uploader("AUBMC 2025", type="csv", key="a25")
+# ─── GITHUB DATA SOURCES ─────────────────────────────────────────────────────
+# Replace each value below with your raw GitHub URL
+# Raw URL format: https://raw.githubusercontent.com/<user>/<repo>/main/<path>.csv
 
-    with st.expander("Emergency Department", expanded=False):
-        f_ed_23 = st.file_uploader("ED 2023", type="csv", key="e23")
-        f_ed_24 = st.file_uploader("ED 2024", type="csv", key="e24")
-        f_ed_25 = st.file_uploader("ED 2025", type="csv", key="e25")
+GITHUB_URLS = {
+    # ── Behaviour survey CSVs (3 departments × 3 years) ──────────────────────
+    "aubmc_23": "AUBMC, Behavior survey responses, 2023.csv",
+    "aubmc_24": "AUBMC, Behavior survey responses, 2024.csv",
+    "aubmc_25": "AUBMC, Behavior raw data 2025.csv",
+    "ed_23":    "ED, Behavior survey responses, 2023.csv",
+    "ed_24":    "ED, Behavior survey responses, 2024.csv",
+    "ed_25":    "ED, Behavior raw data 2025.csv",
+    "patho_23": "Patho & Lab, Behavior survey responses, 2023.csv",
+    "patho_24": "Patho,lab behavior survey responses, 2024.csv",
+    "patho_25": "Patho,Lab, Behavior raw data 2025.csv",
 
-    with st.expander("Pathology & Lab", expanded=False):
-        f_patho_23 = st.file_uploader("Patho 2023", type="csv", key="p23")
-        f_patho_24 = st.file_uploader("Patho 2024", type="csv", key="p24")
-        f_patho_25 = st.file_uploader("Patho 2025", type="csv", key="p25")
-
-    st.markdown("---")
-    st.markdown("### 🔧 Settings")
-    min_forms   = st.slider("Min. evaluations to include", 1, 20, 3)
-    sent_thresh = st.slider("VADER negative threshold", -0.5, 0.0, -0.05, 0.01,
-                            help="Compound score ≤ this value = NEGATIVE")
-    st.markdown("---")
-    st.markdown("**v5.0 · VADER Sentiment**  \n*All IDs anonymised*", unsafe_allow_html=True)
+    # ── Physicians Indicators CSV (Tab 6 — Departments & Divisions) ───────────
+    "indicators": "Physicians indicators.csv",
+}
 
 # ─── DATA LOADING ────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def load_and_process(files_aubmc, files_ed, files_patho, min_f, threshold, _version="v5.0"):
-    depts = {}
+def load_from_github(urls, min_f, threshold, _version="v5.0"):
+    def fetch(url):
+        if not url or url.startswith("REPLACE"):
+            return None
+        try:
+            return pd.read_csv(url)
+        except Exception as e:
+            st.warning(f"Could not load {url}: {e}")
+            return None
 
-    def load_dept(file_list, name):
-        frames = [pd.read_csv(f) for f in file_list if f is not None]
+    def load_dept(keys, name):
+        frames = [fetch(urls[k]) for k in keys]
+        frames = [f for f in frames if f is not None]
         if not frames: return None, None, None
         raw = pd.concat(frames, ignore_index=True)
         return process_dept(raw, name, threshold, min_f=min_f)
 
-    aubmc_raw, aubmc_phys, aubmc_sent = load_dept(files_aubmc, "AUBMC")
-    ed_raw,    ed_phys,    ed_sent    = load_dept(files_ed,    "ED")
-    patho_raw, patho_phys, patho_sent = load_dept(files_patho, "Pathology")
+    aubmc_raw, aubmc_phys, aubmc_sent = load_dept(["aubmc_23","aubmc_24","aubmc_25"], "AUBMC")
+    ed_raw,    ed_phys,    ed_sent    = load_dept(["ed_23","ed_24","ed_25"],           "ED")
+    patho_raw, patho_phys, patho_sent = load_dept(["patho_23","patho_24","patho_25"], "Pathology")
 
     return {
         "AUBMC":     (aubmc_raw, aubmc_phys, aubmc_sent),
@@ -297,63 +301,10 @@ def load_and_process(files_aubmc, files_ed, files_patho, min_f, threshold, _vers
         "Pathology": (patho_raw, patho_phys, patho_sent),
     }
 
-files_aubmc = [f_aubmc_23, f_aubmc_24, f_aubmc_25]
-files_ed    = [f_ed_23,    f_ed_24,    f_ed_25]
-files_patho = [f_patho_23, f_patho_24, f_patho_25]
-
-any_uploaded = any(f is not None for f in files_aubmc + files_ed + files_patho)
-
-if not any_uploaded:
-    # ── LANDING PAGE ─────────────────────────────────────────────────────────
-    st.markdown("# 🏥 AUBMC Physician Performance Dashboard")
-    st.markdown("### Multi-method outlier detection · VADER sentiment · 2023–2025")
-    st.markdown("---")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("""
-        <div class="metric-card">
-            <div class="metric-label">Methodology</div>
-            <div style="margin-top:8px; font-size:14px; color:#374151; line-height:1.6">
-                📏 IQR Outlier Detection<br>
-                📉 Z-Score Analysis<br>
-                🔢 Bottom 10% Threshold<br>
-                🔗 Complaints × Sentiment
-            </div>
-        </div>""", unsafe_allow_html=True)
-    with c2:
-        st.markdown("""
-        <div class="metric-card warning">
-            <div class="metric-label">Sentiment Engine</div>
-            <div style="margin-top:8px; font-size:14px; color:#374151; line-height:1.6">
-                💬 VADER NLP (rule-based)<br>
-                📝 Free-text comment scoring<br>
-                🔄 −1.0 to +1.0 compound scale<br>
-                🚫 Self-evaluations excluded
-            </div>
-        </div>""", unsafe_allow_html=True)
-    with c3:
-        st.markdown("""
-        <div class="metric-card success">
-            <div class="metric-label">Coverage</div>
-            <div style="margin-top:8px; font-size:14px; color:#374151; line-height:1.6">
-                🏥 3 Departments<br>
-                📅 3 Years (2023–2025)<br>
-                🔒 Anonymised physician IDs<br>
-                📤 Export-ready outputs
-            </div>
-        </div>""", unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.info("👈 Upload your CSV files in the sidebar to begin. You can upload one or all three departments.")
-    st.stop()
-
 # ── PROCESS DATA ─────────────────────────────────────────────────────────────
-with st.spinner("Processing data and running VADER sentiment analysis..."):
-    data = load_and_process(
-        tuple(f for f in files_aubmc),
-        tuple(f for f in files_ed),
-        tuple(f for f in files_patho),
+with st.spinner("Loading data from GitHub and running VADER sentiment analysis..."):
+    data = load_from_github(
+        GITHUB_URLS,
         min_forms,
         sent_thresh,
         _version="v5.0"
@@ -1619,20 +1570,39 @@ DIV_TO_DEPT = {
 with tab6:
     st.markdown('<div class="section-header">🏢 Departments & Divisions — Indicators Analysis</div>', unsafe_allow_html=True)
 
-    _ind_already_uploaded = st.session_state.get("ind_upload") is not None
-    with st.expander("📂 Upload Physicians Indicators CSV", expanded=not _ind_already_uploaded):
-        ind_file = st.file_uploader(
-            "Upload CSV", type="csv", key="ind_upload", label_visibility="collapsed",
-            help="Expected columns: Aubnetid, FiscalCycle, Division, ClinicVisits, ClinicWaitingTime, PatientComplaints"
-        )
+    @st.cache_data(show_spinner=False)
+    def load_indicators(url, _version="v5.0"):
+        if not url or url.startswith("REPLACE"):
+            return None
+        try:
+            for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
+                try:
+                    df = pd.read_csv(url, encoding=enc)
+                    break
+                except (UnicodeDecodeError, Exception):
+                    continue
+            else:
+                st.warning("Could not decode indicators file with any known encoding.")
+                return None
+        except Exception as e:
+            st.warning(f"Could not load indicators file: {e}")
+            return None
+        df.columns = df.columns.str.strip()
+        if "Division" in df.columns:
+            df["Division_norm"] = df["Division"].str.strip()
+        if "Department" in df.columns:
+            df["Department"] = df["Department"].str.strip()
+        for col in ["ClinicVisits", "ClinicWaitingTime", "PatientComplaints"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
 
-    if ind_file is None:
-        col_land1, col_land2 = st.columns([1, 1])
-        with col_land1:
-            st.info("👆 Upload your indicators file to begin.")
+    ind_df = load_indicators(GITHUB_URLS.get("indicators", ""), _version="v5.0")
+
+    if ind_df is None:
+        st.info("Indicators data not available. Add the indicators URL to GITHUB_URLS['indicators'] in the source file.")
         st.markdown("---")
         st.markdown('<div class="section-header">📋 AUBMC Organisational Structure</div>', unsafe_allow_html=True)
-        st.caption("This reference panel is hidden once you upload your indicators file.")
         org_cols = st.columns(2)
         dept_list = list(DEPT_DIVISION_MAP.keys())
         half = len(dept_list) // 2
@@ -1647,23 +1617,6 @@ with tab6:
                     else:
                         st.markdown(f"**{dept}**")
     else:
-
-        @st.cache_data
-        def load_indicators(file):
-            df = pd.read_csv(file)
-            df.columns = df.columns.str.strip()
-            # Department and Division columns come directly from the file
-            if "Division" in df.columns:
-                df["Division_norm"] = df["Division"].str.strip()
-            if "Department" in df.columns:
-                df["Department"] = df["Department"].str.strip()
-            for col in ["ClinicVisits", "ClinicWaitingTime", "PatientComplaints"]:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            return df
-
-
-        ind_df = load_indicators(ind_file)
 
         # ── Cycle filter ──────────────────────────────────────────────────────
         cycles = ["All"] + sorted(ind_df["FiscalCycle"].dropna().unique().tolist(), reverse=True) \
@@ -1954,218 +1907,3 @@ with tab6:
         csv_ind = show_renamed.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Export filtered table as CSV", csv_ind,
                            "division_physicians.csv", "text/csv")
-
-        # ══════════════════════════════════════════════════════════════════════
-        # COMPLAINTS × SENTIMENT CROSS-ANALYSIS
-        # ══════════════════════════════════════════════════════════════════════
-        st.markdown("---")
-        st.markdown('<div class="section-header">🔗 Complaints × Sentiment — Combined Outlier Analysis</div>', unsafe_allow_html=True)
-        st.markdown(
-            "Physicians flagged here have **≥1 patient complaint** "
-            "**and/or** negative peer sentiment from survey comments. "
-            "Priority = both signals active · Monitor = one signal · Clear = neither."
-        )
-
-        # ── Check if survey sentiment data is available ───────────────────────
-        sent_frames = []
-        for dept_name in available_depts:
-            _, _, sent_raw = data[dept_name]
-            if sent_raw is not None and not sent_raw.empty:
-                sent_raw_copy = sent_raw.copy()
-                sent_raw_copy["dept_source"] = dept_name
-                sent_frames.append(sent_raw_copy)
-
-        if not sent_frames:
-            st.warning("No survey comment data loaded yet. Upload your behaviour survey CSVs in the sidebar to enable this analysis.")
-        else:
-            # Combine all sentiment data
-            all_sent = pd.concat(sent_frames, ignore_index=True)
-
-            # Build per-physician sentiment summary across all departments
-            sent_cross = (
-                all_sent.assign(is_neg=(all_sent["sentiment"] == "NEGATIVE"))
-                .groupby("physician_id", as_index=False)
-                .agg(
-                    total_comments   =("is_neg",   "count"),
-                    negative_comments=("is_neg",   "sum"),
-                    avg_compound     =("compound", "mean"),
-                )
-            )
-            sent_cross["negative_ratio"] = sent_cross["negative_comments"] / sent_cross["total_comments"]
-
-            # Sentiment flag: IQR upper fence on negative_ratio (min 3 comments)
-            Q1s, Q3s = sent_cross["negative_ratio"].quantile(0.25), sent_cross["negative_ratio"].quantile(0.75)
-            sent_ub  = Q3s + 1.5 * (Q3s - Q1s)
-            sent_cross["sentiment_flag"] = (
-                (sent_cross["negative_ratio"] > sent_ub) &
-                (sent_cross["total_comments"] >= 3)
-            )
-
-            # ── Complaints: IQR upper fence per physician ─────────────────────
-            if "PatientComplaints" not in df_filt.columns or "Aubnetid" not in df_filt.columns:
-                st.warning("PatientComplaints or Aubnetid column not found in indicators file.")
-            else:
-                # Use 2025 data only for complaints × sentiment analysis
-                if "FiscalCycle" in df_filt.columns:
-                    cycles_avail = df_filt["FiscalCycle"].dropna().unique().tolist()
-                    cycle_2025   = [c for c in cycles_avail if "2025" in str(c)]
-                    df_complaints_src = df_filt[df_filt["FiscalCycle"].isin(cycle_2025)] if cycle_2025 else df_filt
-                    cycle_label = "2025" if cycle_2025 else "all cycles (2025 not found)"
-                else:
-                    df_complaints_src = df_filt
-                    cycle_label = "all cycles"
-                st.caption(f"📅 Complaints data: **{cycle_label}** · {len(df_complaints_src):,} records")
-
-                complaints = (
-                    df_complaints_src.groupby("Aubnetid", as_index=False)
-                    .agg(
-                        total_complaints =("PatientComplaints", "sum"),
-                        department       =("Department",        lambda x: x.mode()[0] if not x.empty else "—"),
-                        division         =("Division",          lambda x: x.mode()[0] if not x.empty else "—"),
-                    )
-                )
-                complaints["total_complaints"] = pd.to_numeric(complaints["total_complaints"], errors="coerce").fillna(0)
-
-                # Flag: any physician with >= 1 complaint (zero-tolerance rule)
-                complaints_ub = 0  # kept for scatter plot reference line
-                complaints["complaints_flag"] = complaints["total_complaints"] >= 1
-
-                # ── Merge complaints + sentiment on physician ID ───────────────
-                # Indicators uses Aubnetid; sentiment uses physician_id — same field
-                merged = complaints.merge(
-                    sent_cross.rename(columns={"physician_id": "Aubnetid"}),
-                    on="Aubnetid", how="left"
-                )
-                merged["sentiment_flag"]  = merged["sentiment_flag"].fillna(False)
-                merged["negative_ratio"]  = merged["negative_ratio"].fillna(0)
-                merged["avg_compound"]    = merged["avg_compound"].fillna(0)
-                merged["total_comments"]  = merged["total_comments"].fillna(0).astype(int)
-
-                # ── Combined outlier badge ────────────────────────────────────
-                def combined_badge(row):
-                    if row["complaints_flag"] and row["sentiment_flag"]:
-                        return "Priority"
-                    elif row["complaints_flag"] or row["sentiment_flag"]:
-                        return "Monitor"
-                    return "Clear"
-
-                merged["combined_status"] = merged.apply(combined_badge, axis=1)
-
-                # ── Summary KPIs ──────────────────────────────────────────────
-                n_priority = (merged["combined_status"] == "Priority").sum()
-                n_monitor  = (merged["combined_status"] == "Monitor").sum()
-                n_clear    = (merged["combined_status"] == "Clear").sum()
-                n_total    = len(merged)
-
-                cx1, cx2, cx3, cx4 = st.columns(4)
-                with cx1:
-                    st.markdown(f'''<div class="metric-card danger">
-                        <div class="metric-label">⚠ Priority (Both Flags)</div>
-                        <div class="metric-value">{n_priority}</div>
-                        <div class="metric-sub">{n_priority/n_total*100:.1f}% of physicians</div>
-                    </div>''', unsafe_allow_html=True)
-                with cx2:
-                    st.markdown(f'''<div class="metric-card warning">
-                        <div class="metric-label">👁 Monitor (One Flag)</div>
-                        <div class="metric-value">{n_monitor}</div>
-                        <div class="metric-sub">{n_monitor/n_total*100:.1f}% of physicians</div>
-                    </div>''', unsafe_allow_html=True)
-                with cx3:
-                    st.markdown(f'''<div class="metric-card success">
-                        <div class="metric-label">✓ Clear</div>
-                        <div class="metric-value">{n_clear}</div>
-                        <div class="metric-sub">{n_clear/n_total*100:.1f}% of physicians</div>
-                    </div>''', unsafe_allow_html=True)
-                with cx4:
-                    has_any = int((complaints["total_complaints"] >= 1).sum())
-                    st.markdown(f'''<div class="metric-card neutral">
-                        <div class="metric-label">With ≥1 Complaint</div>
-                        <div class="metric-value">{has_any}</div>
-                        <div class="metric-sub">flagged physicians</div>
-                    </div>''', unsafe_allow_html=True)
-
-                st.markdown("<br>", unsafe_allow_html=True)
-
-                # ── Department peer comparison bar chart ──────────────────────
-                st.markdown("**Priority Physicians vs Department Peers**")
-
-                dept_cross = (
-                    merged.groupby("department", as_index=False)
-                    .agg(
-                        Total        =("Aubnetid",         "count"),
-                        Priority     =("combined_status",  lambda x: (x == "Priority").sum()),
-                        Monitor      =("combined_status",  lambda x: (x == "Monitor").sum()),
-                        Avg_Complaints=("total_complaints","mean"),
-                        Avg_Compound  =("avg_compound",    "mean"),
-                    )
-                )
-                dept_cross["Priority_pct"] = (dept_cross["Priority"] / dept_cross["Total"] * 100).round(1)
-                # Sort descending, then flip for barh so highest is at top
-                dept_cross = dept_cross.sort_values("Priority_pct", ascending=True)
-
-                fig_d, ax_d = plt.subplots(figsize=(10, max(4, len(dept_cross)*0.45)))
-                bar_c = ["#ef4444" if p > 0 else "#10b981" for p in dept_cross["Priority_pct"]]
-                bars_d = ax_d.barh(dept_cross["department"], dept_cross["Priority_pct"],
-                                   color=bar_c, edgecolor="white", linewidth=0.8, alpha=0.85)
-                for bar, pct, n in zip(bars_d, dept_cross["Priority_pct"], dept_cross["Priority"]):
-                    label = f"{pct:.1f}%  ({int(n)} physicians)" if n > 0 else "0%"
-                    ax_d.text(max(pct + 0.2, 0.5), bar.get_y() + bar.get_height()/2,
-                              label, va="center", fontsize=9, fontweight="600",
-                              color="#ef4444" if n > 0 else "#6b7280")
-                ax_d.set_xlabel("% Physicians with Priority Flag (High Complaints + Negative Sentiment)", fontsize=10)
-                ax_d.set_title("Priority Flag Rate by Department", fontsize=11, fontweight="bold")
-                ax_d.grid(axis="x", alpha=0.3, linestyle="--")
-                ax_d.set_facecolor("#fafafa")
-                fig_d.patch.set_facecolor("white")
-                plt.tight_layout()
-                st.pyplot(fig_d, use_container_width=True)
-                plt.close()
-
-                # ── Physician table (Priority first) ──────────────────────────
-                st.markdown("**Physician Combined Outlier Table**")
-                st.caption("Sorted by status → complaints → sentiment score")
-
-                status_order = {"Priority": 0, "Monitor": 1, "Clear": 2}
-                merged["_sort"] = merged["combined_status"].map(status_order)
-                table_out = (
-                    merged.sort_values(["_sort", "total_complaints", "avg_compound"],
-                                       ascending=[True, False, True])
-                    .drop(columns=["_sort"])
-                    [["Aubnetid", "department", "division",
-                      "total_complaints", "complaints_flag",
-                      "total_comments", "negative_ratio", "avg_compound",
-                      "sentiment_flag", "combined_status"]]
-                    .rename(columns={
-                        "Aubnetid":          "Physician ID",
-                        "department":        "Department",
-                        "division":          "Division",
-                        "total_complaints":  "Complaints",
-                        "complaints_flag":   "Complaint Flag",
-                        "total_comments":    "Comments Scored",
-                        "negative_ratio":    "Neg. Ratio",
-                        "avg_compound":      "Sentiment Score",
-                        "sentiment_flag":    "Sentiment Flag",
-                        "combined_status":   "Status",
-                    })
-                    .reset_index(drop=True)
-                )
-                table_out["Neg. Ratio"] = table_out["Neg. Ratio"].apply(lambda x: f"{x:.1%}")
-                table_out["Sentiment Score"] = table_out["Sentiment Score"].apply(lambda x: f"{x:.3f}")
-
-                max_cmp2 = int(table_out["Complaints"].max()) if len(table_out) > 0 else 10
-                st.dataframe(
-                    table_out,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Complaints": st.column_config.ProgressColumn(
-                            min_value=0, max_value=max_cmp2, format="%d"),
-                        "Status": st.column_config.SelectboxColumn(
-                            options=["Priority", "Monitor", "Clear"]),
-                    }
-                )
-
-                # Export
-                csv_cross = table_out.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Export combined outlier table", csv_cross,
-                                   "complaints_sentiment_outliers.csv", "text/csv")
