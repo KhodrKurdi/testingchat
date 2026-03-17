@@ -122,11 +122,25 @@ def add_year(df):
     return df
 
 def aggregate_physician(df):
-    return (
-        df.groupby("physician_id", as_index=False)
-        .agg(avg_behavior_score=("overall_score","mean"),
-             n_forms=("overall_score","count"))
-    )
+    # Exclude self-evaluations — not peer assessments
+    if "raters_group" in df.columns:
+        df = df[df["raters_group"] != "Faculty Self-Evaluation"].copy()
+
+    q_cols = [c for c in df.columns if c.startswith("q_")]
+
+    # Flat mean: stack all question responses across all forms per physician,
+    # drop NaN, then take a single mean — avoids mean-of-means distortion
+    # where forms with fewer answered questions get equal weight to full forms
+    def flat_mean(grp):
+        vals = grp[q_cols].values.flatten()
+        vals = vals[~pd.isnull(vals)]
+        return float(vals.mean()) if len(vals) > 0 else np.nan
+
+    grouped = df.groupby("physician_id")
+    scores  = grouped.apply(flat_mean).reset_index()
+    scores.columns = ["physician_id", "avg_behavior_score"]
+    n_forms = grouped.size().reset_index(name="n_forms")
+    return scores.merge(n_forms, on="physician_id")
 
 def add_outlier_flags(phys_df):
     df = phys_df.copy()
@@ -204,7 +218,7 @@ def risk_pill(score):
     if score >= 1:   return '<span class="pill-yellow">👁 Monitor</span>'
     return '<span class="pill-green">✓ Clear</span>'
 
-def process_dept(df_raw, dept_name, threshold=-0.05):
+def process_dept(df_raw, dept_name, threshold=-0.05, min_f=3):
     df = clean_headers(df_raw)
     df = map_ratings(df)
     df = compute_score(df)
@@ -212,6 +226,9 @@ def process_dept(df_raw, dept_name, threshold=-0.05):
     # Aggregate and flag on 2025 only — consistent with notebook methodology
     df_2025 = df[df["year"] == 2025] if ("year" in df.columns and not df[df["year"] == 2025].empty) else df
     phys = aggregate_physician(df_2025)
+    # Apply min_forms BEFORE outlier detection so thresholds are computed
+    # on the same population that will appear in results (matches notebook)
+    phys = phys[phys["n_forms"] >= min_f].copy().reset_index(drop=True)
     phys, mean, std = add_outlier_flags(phys)
     sent_raw = run_sentiment(df, threshold) if "comments" in df.columns else pd.DataFrame()
     if not sent_raw.empty:
@@ -268,16 +285,11 @@ def load_and_process(files_aubmc, files_ed, files_patho, min_f, threshold, _vers
         frames = [pd.read_csv(f) for f in file_list if f is not None]
         if not frames: return None, None, None
         raw = pd.concat(frames, ignore_index=True)
-        return process_dept(raw, name, threshold)
+        return process_dept(raw, name, threshold, min_f=min_f)
 
     aubmc_raw, aubmc_phys, aubmc_sent = load_dept(files_aubmc, "AUBMC")
     ed_raw,    ed_phys,    ed_sent    = load_dept(files_ed,    "ED")
     patho_raw, patho_phys, patho_sent = load_dept(files_patho, "Pathology")
-
-    # apply min_forms filter
-    for phys in [aubmc_phys, ed_phys, patho_phys]:
-        if phys is not None:
-            phys.drop(phys[phys["n_forms"] < min_f].index, inplace=True)
 
     return {
         "AUBMC":     (aubmc_raw, aubmc_phys, aubmc_sent),
@@ -1024,6 +1036,9 @@ with tab5:
     with tf1:
         trend_dept = st.selectbox("Department", available_depts, key="trend_dept")
     raw_d, phys_d, _ = data[trend_dept]
+    # Exclude self-evaluations from all trend calculations
+    if raw_d is not None and "raters_group" in raw_d.columns:
+        raw_d = raw_d[raw_d["raters_group"] != "Faculty Self-Evaluation"].copy()
 
     if raw_d is None or raw_d.empty or "year" not in raw_d.columns or raw_d["year"].isna().all():
         st.warning("Year data not available. Check that your files include a Fillout Date column.")
@@ -1050,6 +1065,7 @@ with tab5:
             for yr in years_avail:
                 df_yr   = raw_d[raw_d["year"] == yr]
                 phys_yr = aggregate_physician(df_yr)
+                phys_yr = phys_yr[phys_yr["n_forms"] >= min_forms].copy().reset_index(drop=True)
                 phys_yr, _, _ = add_outlier_flags(phys_yr)
                 trend_rows.append({
                     "Year":             yr,
@@ -1146,11 +1162,14 @@ with tab5:
                     if yr_data.empty:
                         continue
                     q_cols = [c for c in yr_data.columns if c.startswith("q_")]
+                    # Flat mean across all question responses — consistent with aggregate_physician
+                    flat_vals = yr_data[q_cols].values.flatten()
+                    flat_vals = flat_vals[~pd.isnull(flat_vals)]
+                    flat_mean = float(flat_vals.mean()) if len(flat_vals) > 0 else np.nan
                     phys_year_rows.append({
                         "Year":           yr,
                         "Forms":          len(yr_data),
-                        "Avg Score":      round(yr_data["overall_score"].mean(), 3),
-                        "Median Score":   round(yr_data["overall_score"].median(), 3),
+                        "Avg Score":      round(flat_mean, 3),
                         "Min Score":      round(yr_data["overall_score"].min(), 3),
                         "Max Score":      round(yr_data["overall_score"].max(), 3),
                         "Score Std":      round(yr_data["overall_score"].std(), 3) if len(yr_data) > 1 else 0.0,
@@ -1160,11 +1179,13 @@ with tab5:
                 if phys_trend.empty:
                     st.warning("No year-level data available for this physician.")
                 else:
-                    # Compute dept avg per year for benchmarking
+                    # Compute dept avg per year for benchmarking — flat mean consistent with aggregate_physician
                     dept_avgs = {}
                     for yr in years_avail:
-                        yr_all = raw_d[raw_d["year"] == yr]["overall_score"].dropna()
-                        dept_avgs[yr] = yr_all.mean() if not yr_all.empty else np.nan
+                        yr_df   = raw_d[raw_d["year"] == yr]
+                        phys_yr_bench = aggregate_physician(yr_df)
+                        phys_yr_bench = phys_yr_bench[phys_yr_bench["n_forms"] >= min_forms]
+                        dept_avgs[yr] = phys_yr_bench["avg_behavior_score"].mean() if not phys_yr_bench.empty else np.nan
 
                     # KPI summary cards
                     years_seen = phys_trend["Year"].tolist()
@@ -1263,6 +1284,7 @@ with tab5:
                     for yr in phys_trend["Year"].tolist():
                         yr_all   = raw_d[raw_d["year"] == yr]
                         phys_agg = aggregate_physician(yr_all)
+                        phys_agg = phys_agg[phys_agg["n_forms"] >= min_forms].copy()
                         if selected_phys in phys_agg["physician_id"].values:
                             phys_agg["pct"] = phys_agg["avg_behavior_score"].rank(pct=True) * 100
                             pct_val = phys_agg.loc[
@@ -1428,8 +1450,14 @@ with tab5:
                         row = {"Physician ID": pid}
                         all_scores = []
                         for yr in years_avail:
-                            yr_scores = pid_data[pid_data["year"] == yr]["overall_score"].dropna()
-                            avg = round(yr_scores.mean(), 3) if not yr_scores.empty else np.nan
+                            yr_data_pid = pid_data[pid_data["year"] == yr]
+                            if yr_data_pid.empty:
+                                avg = np.nan
+                            else:
+                                q_cols_pid = [c for c in yr_data_pid.columns if c.startswith("q_")]
+                                flat_pid = yr_data_pid[q_cols_pid].values.flatten()
+                                flat_pid = flat_pid[~pd.isnull(flat_pid)]
+                                avg = round(float(flat_pid.mean()), 3) if len(flat_pid) > 0 else np.nan
                             row[str(yr)] = avg
                             if not np.isnan(avg):
                                 all_scores.append(avg)
