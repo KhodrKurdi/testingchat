@@ -166,60 +166,34 @@ def score_vader(text, threshold=-0.05):
     try:
         s = vader.polarity_scores(str(text))
         c = s["compound"]
-        label = "POSITIVE" if c >= abs(threshold) else ("NEGATIVE" if c <= threshold else "NEUTRAL")
+        # Notebook uses standard VADER thresholds fixed at ±0.05
+        label = "POSITIVE" if c >= 0.05 else ("NEGATIVE" if c <= -0.05 else "NEUTRAL")
         return {"compound": c, "sentiment": label}
     except:
         return {"compound": 0.0, "sentiment": "NEUTRAL"}
 
 def run_sentiment(df, threshold=-0.05):
-    import re as _re
-
-    # Normalise text: strip whitespace, remove non-printable chars, lowercase
-    def _normalise(text):
-        t = str(text).strip()
-        t = _re.sub(r"[^ -~؀-ۿ]", " ", t)  # keep ASCII + Arabic
-        t = _re.sub(r"\s+", " ", t).strip()
-        return t.lower()
-
-    SKIP_EXACT = {
-        "d/a", "n/a", "na", "n.a", "n.a.", "-", "--", "---", "none", "nil", ".",
-        "no comment", "no comments", "no interaction", "no interactions",
-        "i have never had the chance to work with", "never had the chance to work with",
-        "i have not had the chance to work with", "not had the chance to work with",
-        "i have never worked with", "never worked with",
-        "i have not worked with", "no opportunity to work with",
-        "no opportunity", "not applicable", "not available",
-    }
-    SKIP_PREFIXES = (
-        "no comment", "no comments", "no interaction", "no opportunity",
-        "d/a", "n/a",
-        "i have never had the chance", "i have not had the chance",
-        "never had the chance", "i never had the chance",
-        "haven't had the chance", "have not had the chance",
-        "i have never worked", "i have not worked", "never worked with",
-    )
-
-    def _is_skip(raw):
-        t = _normalise(raw)
-        t_clean = t.rstrip(".,;:!?/ ")
-        # exact match
-        if t_clean in SKIP_EXACT or t in SKIP_EXACT:
-            return True
-        # prefix match
-        return any(t_clean.startswith(p) or t.startswith(p) for p in SKIP_PREFIXES)
-
+    # Match notebook: score all non-empty, non-self-eval comments — no skip list
     df_s = df[
         (df.get("raters_group", pd.Series(dtype=str)) != "Faculty Self-Evaluation") &
         (df["comments"].notna()) &
-        (df["comments"].astype(str).str.strip() != "") &
-        (~df["comments"].astype(str).apply(_is_skip))
+        (df["comments"].astype(str).str.strip() != "")
     ].copy()
     df_s["comments"] = df_s["comments"].astype(str).str.strip()
     results = df_s["comments"].apply(lambda t: score_vader(t, threshold))
     df_s = pd.concat([df_s, pd.DataFrame(results.tolist(), index=df_s.index)], axis=1)
     return df_s
 
-def sentiment_summary(df_sent, min_comments=3, threshold=-0.05):
+def sentiment_summary(df_sent, min_comments=5, threshold=-0.05):
+    # Check if any comment has compound < 0 (catches comments VADER labels NEUTRAL but are still negative-leaning)
+    has_any_negative = (
+        df_sent[df_sent["compound"] < 0]
+        .groupby("physician_id")
+        .size()
+        .reset_index(name="n_neg_compound")
+    )
+    has_any_negative["has_negative"] = True
+
     s = (
         df_sent.assign(is_neg=(df_sent["sentiment"]=="NEGATIVE"))
         .groupby("physician_id", as_index=False)
@@ -228,9 +202,14 @@ def sentiment_summary(df_sent, min_comments=3, threshold=-0.05):
              avg_compound=("compound","mean"))
     )
     s["negative_ratio"] = s["negative_comments"] / s["total_comments"]
-    Q1, Q3 = s["negative_ratio"].quantile(0.25), s["negative_ratio"].quantile(0.75)
-    ub = Q3 + 1.5*(Q3-Q1)
-    s["negative_outlier"] = (s["negative_ratio"] > ub) & (s["total_comments"] >= min_comments)
+
+    # Merge in the any-negative flag
+    s = s.merge(has_any_negative[["physician_id","has_negative"]], on="physician_id", how="left")
+    s["has_negative"] = s["has_negative"].fillna(False)
+
+    # Flag if physician has ANY comment with compound < 0
+    s["negative_outlier"] = s["has_negative"]
+    s = s.drop(columns=["has_negative"])
     return s
 
 def merge_sentiment(phys_df, sent_s):
@@ -258,7 +237,7 @@ def risk_pill(score):
     if score >= 1:   return '<span class="pill-yellow">👁 Monitor</span>'
     return '<span class="pill-green">✓ Clear</span>'
 
-def process_dept(df_raw, dept_name, threshold=-0.05, min_f=3):
+def process_dept(df_raw, dept_name, threshold=-0.05, min_f=1):
     df = clean_headers(df_raw)
     df = map_ratings(df)
     df = compute_score(df)
@@ -272,10 +251,20 @@ def process_dept(df_raw, dept_name, threshold=-0.05, min_f=3):
     phys, mean, std = add_outlier_flags(phys)
     sent_raw = run_sentiment(df, threshold) if "comments" in df.columns else pd.DataFrame()
     if not sent_raw.empty:
-        # Use 2025 only for negative_outlier flag (consistent with complaints logic)
-        sent_2025 = sent_raw[sent_raw["year"] == 2025] if "year" in sent_raw.columns and not sent_raw[sent_raw["year"] == 2025].empty else sent_raw
-        sent_s = sentiment_summary(sent_2025)
-        phys   = merge_sentiment(phys, sent_s)
+        # Compute sentiment on 2025 comments where available, else fall back to all years.
+        # This ensures physicians with comments only in 2023/2024 are still evaluated.
+        if "year" in sent_raw.columns and not sent_raw[sent_raw["year"] == 2025].empty:
+            sent_2025 = sent_raw[sent_raw["year"] == 2025]
+        else:
+            sent_2025 = sent_raw
+        sent_s_2025 = sentiment_summary(sent_2025)
+
+        # For physicians with no 2025 comments, supplement from all-years sentiment
+        sent_s_all  = sentiment_summary(sent_raw)
+        missing     = ~sent_s_all["physician_id"].isin(sent_s_2025["physician_id"])
+        sent_s      = pd.concat([sent_s_2025, sent_s_all[missing]], ignore_index=True)
+
+        phys = merge_sentiment(phys, sent_s)
     else:
         phys["total_comments"]   = 0
         phys["negative_ratio"]   = np.nan
@@ -311,7 +300,7 @@ GITHUB_URLS = {
 
 # ─── DATA LOADING ────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def load_from_github(urls, min_f, threshold, _version="v5.0"):
+def load_from_github(urls, min_f, threshold, _version="v5.1"):
     def fetch(url):
         if not url or url.startswith("REPLACE"):
             return None
@@ -344,7 +333,7 @@ with st.spinner("Loading data from GitHub and running VADER sentiment analysis..
         GITHUB_URLS,
         min_forms,
         sent_thresh,
-        _version="v5.0"
+        _version="v5.1"
     )
 
 # Build combined physician table from available departments
@@ -557,6 +546,12 @@ with tab1:
 
         if all_sent_frames:
             sent_all = pd.concat(all_sent_frames, ignore_index=True)
+            # Filter out noise comments from display counts (same as deep-dive display filter)
+            _skip_t1 = {"d/a","n/a","na","n.a","n.a.","-","--","---","none","nil",".","..","...","no comment","no comments","no interaction","no interactions","not applicable","not available","no opportunity"}
+            def _is_noise(t):
+                t2 = str(t).strip().lower().rstrip(".,;:!?/ ")
+                return t2 in _skip_t1 or any(t2.startswith(p) for p in ("no comment","no interaction","no opportunity","d/a","n/a","i have never","never had the chance","haven't had the chance","i have not"))
+            sent_all = sent_all[~sent_all["comments"].astype(str).apply(_is_noise)].copy()
             total_c  = len(sent_all)
             neg_c    = (sent_all["sentiment"] == "NEGATIVE").sum()
             pos_c    = (sent_all["sentiment"] == "POSITIVE").sum()
@@ -738,7 +733,7 @@ with tab2:
                 phys_src, _, _ = add_outlier_flags(phys_src)
                 # Re-merge 2025 sentiment for this year's risk computation
                 if sent_dd is not None and not sent_dd.empty and int(dd_year) == 2025:
-                    sent_yr = sentiment_summary(sent_dd, min_comments=3)
+                    sent_yr = sentiment_summary(sent_dd)
                     phys_src = merge_sentiment(phys_src, sent_yr)
                 else:
                     phys_src["negative_outlier"] = False
@@ -779,8 +774,14 @@ with tab2:
                     phys_comments = phys_comments[phys_comments["year"] == int(dd_year)]
                 if not phys_comments.empty:
                     yr_suffix = f", {dd_year}" if dd_year != "All Years" else ""
-                    st.markdown(f"**Peer Comments** ({len(phys_comments)} total{yr_suffix}):")
-                    for _, crow in phys_comments.sort_values("compound").iterrows():
+                    # Filter out display-only noise comments (D/A, No comment, etc.)
+                    _skip = {"d/a","n/a","na","n.a","n.a.","-","--","---","none","nil",".","..","...","no comment","no comments","no interaction","no interactions","not applicable","not available","no opportunity"}
+                    def _is_display_skip(t):
+                        t2 = str(t).strip().lower().rstrip(".,;:!?/ ")
+                        return t2 in _skip or any(t2.startswith(p) for p in ("no comment","no interaction","no opportunity","d/a","n/a","i have never","never had the chance","haven't had the chance","i have not"))
+                    phys_comments_display = phys_comments[~phys_comments["comments"].astype(str).apply(_is_display_skip)]
+                    st.markdown(f"**Peer Comments** ({len(phys_comments_display)} total{yr_suffix}):")
+                    for _, crow in phys_comments_display.sort_values("compound").iterrows():
                         css_class = "neg" if crow["sentiment"]=="NEGATIVE" else ("pos" if crow["sentiment"]=="POSITIVE" else "neu")
                         emoji     = "🔴" if crow["sentiment"]=="NEGATIVE" else ("🟢" if crow["sentiment"]=="POSITIVE" else "⚪")
                         year_str  = str(int(crow["year"])) if "year" in crow and pd.notna(crow.get("year")) else "—"
@@ -949,6 +950,12 @@ with tab4:
         st.info("No comment data available. Upload behaviour survey CSVs to enable sentiment analysis.")
     else:
         all_sent = pd.concat(sent_frames, ignore_index=True)
+        # Filter noise comments from display
+        _skip_t4 = {"d/a","n/a","na","n.a","n.a.","-","--","---","none","nil",".","..","...","no comment","no comments","no interaction","no interactions","not applicable","not available","no opportunity"}
+        def _is_noise_t4(t):
+            t2 = str(t).strip().lower().rstrip(".,;:!?/ ")
+            return t2 in _skip_t4 or any(t2.startswith(p) for p in ("no comment","no interaction","no opportunity","d/a","n/a","i have never","never had the chance","haven't had the chance","i have not"))
+        all_sent = all_sent[~all_sent["comments"].astype(str).apply(_is_noise_t4)].copy()
 
         # ── KPI row ───────────────────────────────────────────────────────────
         sc1, sc2, sc3, sc4 = st.columns(4)
@@ -1682,7 +1689,7 @@ with tab6:
     st.markdown('<div class="section-header">🏢 Departments & Divisions — Indicators Analysis</div>', unsafe_allow_html=True)
 
     @st.cache_data(show_spinner=False)
-    def load_indicators(url, _version="v5.0"):
+    def load_indicators(url, _version="v5.1"):
         if not url or url.startswith("REPLACE"):
             return None
         try:
@@ -1708,7 +1715,7 @@ with tab6:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
 
-    ind_df = load_indicators(GITHUB_URLS.get("indicators", ""), _version="v5.0")
+    ind_df = load_indicators(GITHUB_URLS.get("indicators", ""), _version="v5.1")
 
     if ind_df is None:
         st.info("Indicators data not available. Add the indicators URL to GITHUB_URLS['indicators'] in the source file.")
